@@ -2,15 +2,16 @@
   "name": "restaurant-erp-mvp",
   "version": "0.1.0",
   "description": "Restaurant Management ERP - MVP backend (multi-tenant SaaS)",
-  "main": "dist/server.js",
+  "main": "dist/src/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "seed": "ts-node prisma/seed.ts",
+    "seed": "node dist/prisma/seed.js",
+    "seed:dev": "ts-node prisma/seed.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
