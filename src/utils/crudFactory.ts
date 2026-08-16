@@ -94,11 +94,18 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
         ];
       }
 
+      // Not every model has a createdAt column (most master-data tables
+      // don't), so unlike an earlier version of this factory we can't
+      // default to `{ createdAt: "desc" }` - Prisma throws if the field
+      // doesn't exist on that model. Screens that want a specific order
+      // pass opts.orderBy explicitly; otherwise we leave it undefined and
+      // let Postgres return its natural (typically insertion) order,
+      // which never throws regardless of the model's columns.
       const [items, total] = await Promise.all([
         delegate.findMany({
           where,
           include: opts.include,
-          orderBy: opts.orderBy ?? { createdAt: "desc" },
+          orderBy: opts.orderBy,
           skip: (page - 1) * pageSize,
           take: pageSize,
         }),
