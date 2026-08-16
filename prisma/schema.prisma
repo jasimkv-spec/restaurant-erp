@@ -1,0 +1,2659 @@
+// ============================================================================
+// Restaurant Management ERP - MVP Database Schema
+// Derived from: BRD & Product Blueprint, MVP Database/ERD Blueprint,
+//               MVP Detailed Field Dictionary, Screen-Wise Field Specification.
+//
+// Design principles carried over from the blueprint docs:
+//  - Hybrid SaaS: shared DB with tenant_id for small clients; dedicated DB
+//    (same schema) for enterprise clients. Every tenant-owned table carries
+//    tenant_id and must be scoped by the tenant-resolution middleware.
+//  - Surrogate UUID primary keys everywhere (distributed-SaaS / API safe).
+//  - Ledgers (stock_ledger, journal lines, audit_logs) are append-only;
+//    corrections happen via reversal/adjustment documents, not edits/deletes.
+//  - Master data uses status/is_active; posted transactions are never deleted.
+//  - Standard audit columns: created_at, created_by, updated_at, updated_by,
+//    and posted_at/posted_by on postable documents.
+//  - Status fields are free-form controlled strings (see Statuses & Actions
+//    reference sheet) rather than DB enums, so tenants/admins can extend
+//    workflow without a migration.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// 1. SaaS / TENANT PLATFORM
+// ============================================================================
+
+model Tenant {
+  id                String   @id @default(uuid())
+  code              String   @unique
+  name              String
+  subdomain         String   @unique
+  planId            String?  @map("plan_id")
+  databaseMode      String   @default("Shared") @map("database_mode") // Shared | Dedicated
+  status            String   @default("Trial") // Trial | Active | Suspended | Cancelled
+  timezone          String   @default("UTC")
+  baseCurrencyId    String?  @map("base_currency_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  plan              SubscriptionPlan? @relation(fields: [planId], references: [id])
+  modules           TenantModule[]
+  databaseConnections TenantDatabaseConnection[]
+
+  // --- Admin ---
+  companies         Company[]
+  branches          Branch[]
+  warehouses        Warehouse[]
+  costCentres       CostCentre[]
+  profitCentres     ProfitCentre[]
+  financialPeriods  FinancialPeriod[]
+  documentSeries    DocumentSeries[]
+  companyPolicies   CompanyPolicy[]
+
+  // --- Security ---
+  users                User[]
+  roles                Role[]
+  rolePermissions      RolePermission[]
+  userRoles            UserRole[]
+  userBranchAccess     UserBranchAccess[]
+  userWarehouseAccess  UserWarehouseAccess[]
+  auditLogs            AuditLog[]
+
+  // --- Masters ---
+  areas             Area[]
+  taxes             Tax[]
+  uoms              Uom[]
+  uomConversions    UomConversion[]
+  terms             Term[]
+  paymentMethods    PaymentMethod[]
+
+  // --- Product classification ---
+  productGroups     ProductGroup[]
+  productSubgroups  ProductSubgroup[]
+  productFamilies   ProductFamily[]
+  brands            Brand[]
+  menus             Menu[]
+  menuItems         MenuItem[]
+
+  // --- Inventory ---
+  itemCategories       ItemCategory[]
+  items                Item[]
+  itemGlMappings       ItemGlMapping[]
+  itemPrices           ItemPrice[]
+  itemVendorMappings   ItemVendorMapping[]
+  stockLedgerEntries   StockLedger[]
+  stockBalances        StockBalance[]
+  stockAdjustments     StockAdjustment[]
+  stockAdjustmentLines StockAdjustmentLine[]
+
+  // --- Procurement ---
+  vendors                Vendor[]
+  vendorDocuments        VendorDocument[]
+  materialRequests       MaterialRequest[]
+  materialRequestLines   MaterialRequestLine[]
+  mrConsolidations       MrConsolidation[]
+  mrConsolidationLines   MrConsolidationLine[]
+  rfqs                   Rfq[]
+  rfqLines               RfqLine[]
+  rfqVendorQuotes        RfqVendorQuote[]
+  purchaseOrders         PurchaseOrder[]
+  purchaseOrderLines     PurchaseOrderLine[]
+  grns                   Grn[]
+  grnLines               GrnLine[]
+  goodsReturns           GoodsReturn[]
+  goodsReturnLines       GoodsReturnLine[]
+  stockTransfers         StockTransfer[]
+  stockTransferLines     StockTransferLine[]
+  purchaseInvoices       PurchaseInvoice[]
+  purchaseInvoiceGrns    PurchaseInvoiceGrn[]
+  vendorDebitNotes       VendorDebitNote[]
+  vendorPayments         VendorPayment[]
+  vendorPaymentInvoices  VendorPaymentInvoice[]
+
+  // --- Recipe ---
+  recipes              Recipe[]
+  recipeVersions       RecipeVersion[]
+  recipeIngredients    RecipeIngredient[]
+  recipeCostSnapshots  RecipeCostSnapshot[]
+  productionPostings   ProductionPosting[]
+  productionPostingLines ProductionPostingLine[]
+  salesInvoiceLineModifiers SalesInvoiceLineModifier[]
+
+  // --- Sales / POS ---
+  customers            Customer[]
+  salesChannels        SalesChannel[]
+  posConnectors        PosConnector[]
+  posItemMappings      PosItemMapping[]
+  salesImportBatches   SalesImportBatch[]
+  salesInvoices        SalesInvoice[]
+  salesInvoiceLines    SalesInvoiceLine[]
+  salesPayments        SalesPayment[]
+  salesQuotes          SalesQuote[]
+  salesQuoteLines      SalesQuoteLine[]
+  deliveryOrders       DeliveryOrder[]
+  deliveryOrderLines   DeliveryOrderLine[]
+  salesReturns         SalesReturn[]
+  salesReturnLines     SalesReturnLine[]
+  customerCreditNotes  CustomerCreditNote[]
+
+  // --- Consumption ---
+  consumptionPostings    ConsumptionPosting[]
+  consumptionLines       ConsumptionLine[]
+  consumptionExceptions  ConsumptionException[]
+
+  // --- Finance ---
+  accountGroups       AccountGroup[]
+  chartOfAccounts     ChartOfAccount[]
+  bankAccounts        BankAccount[]
+  journalEntries      JournalEntry[]
+  journalLines        JournalLine[]
+  postingRules        PostingRule[]
+  postingExceptions   PostingException[]
+  customerReceipts    CustomerReceipt[]
+  customerReceiptInvoices CustomerReceiptInvoice[]
+  contraVouchers      ContraVoucher[]
+  bankStatementLines  BankStatementLine[]
+
+  // --- Workflow / Documents ---
+  documentTypes        DocumentType[]
+  documentAttachments  DocumentAttachment[]
+  approvalWorkflows    ApprovalWorkflow[]
+  approvalTasks        ApprovalTask[]
+  notifications        Notification[]
+
+  @@map("tenants")
+}
+
+model SubscriptionPlan {
+  id            String   @id @default(uuid())
+  code          String   @unique
+  name          String
+  billingCycle  String   @map("billing_cycle") // Monthly | Annual
+  basePrice     Decimal  @default(0) @map("base_price") @db.Decimal(18, 3)
+  status        String   @default("Active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenants       Tenant[]
+
+  @@map("subscription_plans")
+}
+
+model TenantModule {
+  id            String    @id @default(uuid())
+  tenantId      String    @map("tenant_id")
+  moduleCode    String    @map("module_code") // Admin|Security|Inventory|Procurement|Recipe|Sales|Consumption|Finance|Workflow|SaaS
+  enabled       Boolean   @default(true)
+  effectiveFrom DateTime  @default(now()) @map("effective_from")
+
+  tenant        Tenant    @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, moduleCode])
+  @@index([tenantId])
+  @@map("tenant_modules")
+}
+
+model TenantDatabaseConnection {
+  id                    String   @id @default(uuid())
+  tenantId              String   @map("tenant_id")
+  mode                  String   // Shared | Dedicated
+  encryptedConnectionRef String? @map("encrypted_connection_ref") // never exposed to tenant users
+  status                String   @default("Active")
+
+  tenant                Tenant   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("tenant_database_connections")
+}
+
+// ============================================================================
+// 2. ADMIN / ORGANIZATION SETUP
+// ============================================================================
+
+model Company {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  code           String
+  name           String
+  legalName      String?  @map("legal_name")
+  baseCurrencyId String?  @map("base_currency_id")
+  taxNo          String?  @map("tax_no")
+  registrationNumber String? @map("registration_number")
+  contactNumber  String?  @map("contact_number")
+  address        String?
+  logoUrl        String?  @map("logo_url")
+  dateFormat     String   @default("dd-MM-yyyy") @map("date_format")
+  status         String   @default("Active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant             @relation(fields: [tenantId], references: [id])
+  branches         Branch[]
+  costCentres      CostCentre[]
+  profitCentres    ProfitCentre[]
+  financialPeriods FinancialPeriod[]
+  documentSeries   DocumentSeries[]
+  chartOfAccounts  ChartOfAccount[]
+  bankAccounts     BankAccount[]
+  journalEntries   JournalEntry[]
+  companyPolicies  CompanyPolicy[]
+  contraVouchers   ContraVoucher[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("companies")
+}
+
+model Branch {
+  id                  String   @id @default(uuid())
+  tenantId            String   @map("tenant_id")
+  companyId           String   @map("company_id")
+  code                String
+  name                String
+  branchType          String   @map("branch_type") // Head Office | Outlet | Central Kitchen | Warehouse | Franchise Outlet
+  defaultWarehouseId  String?  @map("default_warehouse_id")
+  profitCentreId      String?  @map("profit_centre_id")
+  status              String   @default("Active")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant   @relation(fields: [tenantId], references: [id])
+  company             Company  @relation(fields: [companyId], references: [id])
+
+  warehouses          Warehouse[]
+  materialRequests    MaterialRequest[]
+  purchaseOrders      PurchaseOrder[]
+  grns                Grn[]
+  salesInvoices       SalesInvoice[]
+  posConnectors       PosConnector[]
+  posItemMappings     PosItemMapping[]
+  salesImportBatches  SalesImportBatch[]
+  consumptionPostings ConsumptionPosting[]
+  itemPrices          ItemPrice[]
+  userBranchAccess    UserBranchAccess[]
+  rfqs                Rfq[]
+  goodsReturns        GoodsReturn[]
+  stockTransfersFrom  StockTransfer[] @relation("StockTransferFromBranch")
+  stockTransfersTo    StockTransfer[] @relation("StockTransferToBranch")
+  stockAdjustments    StockAdjustment[]
+  salesQuotes         SalesQuote[]
+  deliveryOrders      DeliveryOrder[]
+  salesReturns        SalesReturn[]
+  recipeCostSnapshots RecipeCostSnapshot[]
+  productionPostings  ProductionPosting[]
+
+  @@unique([tenantId, companyId, code])
+  @@index([tenantId])
+  @@map("branches")
+}
+
+model Warehouse {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  branchId       String   @map("branch_id")
+  code           String
+  name           String
+  warehouseType  String   @map("warehouse_type") // Raw Material|Kitchen|Finished Goods|Dispatch|Quarantine|Rejected|In-Transit
+  isQuarantine   Boolean  @default(false) @map("is_quarantine")
+  isInTransit    Boolean  @default(false) @map("is_in_transit")
+  status         String   @default("Active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant    @relation(fields: [tenantId], references: [id])
+  branch         Branch    @relation(fields: [branchId], references: [id])
+
+  stockLedgerEntries StockLedger[]
+  stockBalances      StockBalance[]
+  userAccess         UserWarehouseAccess[]
+  materialRequests   MaterialRequest[]
+  grns               Grn[]
+  consumptionLines   ConsumptionLine[]
+  goodsReturns       GoodsReturn[]
+  stockTransfersFrom StockTransfer[] @relation("StockTransferFromWarehouse")
+  stockTransfersTo   StockTransfer[] @relation("StockTransferToWarehouse")
+  stockTransfersTransit StockTransfer[] @relation("StockTransferTransitWarehouse")
+  stockAdjustments   StockAdjustment[]
+  deliveryOrders     DeliveryOrder[]
+  salesReturns       SalesReturn[]
+  recipeCostSnapshots RecipeCostSnapshot[]
+  productionPostings  ProductionPosting[]
+
+  @@unique([tenantId, branchId, code])
+  @@index([tenantId])
+  @@map("warehouses")
+}
+
+model CostCentre {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  companyId String   @map("company_id")
+  parentId  String?  @map("parent_id")
+  code      String
+  name      String
+  status    String   @default("Active")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  company   Company  @relation(fields: [companyId], references: [id])
+  parent    CostCentre?  @relation("CostCentreParent", fields: [parentId], references: [id])
+  children  CostCentre[] @relation("CostCentreParent")
+
+  journalLines JournalLine[]
+
+  @@unique([tenantId, companyId, code])
+  @@index([tenantId])
+  @@map("cost_centres")
+}
+
+model ProfitCentre {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  companyId String   @map("company_id")
+  branchId  String?  @map("branch_id")
+  code      String
+  name      String
+  status    String   @default("Active")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  company   Company  @relation(fields: [companyId], references: [id])
+
+  journalLines JournalLine[]
+
+  @@unique([tenantId, companyId, code])
+  @@index([tenantId])
+  @@map("profit_centres")
+}
+
+model FinancialPeriod {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  companyId       String   @map("company_id")
+  fiscalYear      Int      @map("fiscal_year")
+  monthNo         Int      @map("month_no")
+  startDate       DateTime @map("start_date")
+  endDate         DateTime @map("end_date")
+  inventoryStatus String   @default("Open") @map("inventory_status") // Open|Soft Closed|Closed|Locked|Reopened
+  financeStatus   String   @default("Open") @map("finance_status")
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  company         Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([tenantId, companyId, fiscalYear, monthNo])
+  @@index([tenantId, companyId, startDate, endDate])
+  @@map("financial_periods")
+}
+
+model DocumentSeries {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  companyId    String   @map("company_id")
+  branchId     String?  @map("branch_id")
+  moduleCode   String   @map("module_code")
+  prefix       String
+  nextNo       Int      @default(1) @map("next_no")
+  resetPolicy  String   @default("Never") @map("reset_policy") // Never|Yearly|Monthly
+  digitLength  Int      @default(6) @map("digit_length") // how many digits the serial pads out to, e.g. 6 -> 000012
+  padChar      String   @default("0") @map("pad_char")
+  separator    String   @default("-") @map("separator") // between prefix/year/month/serial segments
+  includeYear  Boolean  @default(false) @map("include_year")
+  yearFormat   String   @default("YYYY") @map("year_format") // YYYY|YY
+  includeMonth Boolean  @default(false) @map("include_month")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  company      Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([tenantId, companyId, branchId, moduleCode])
+  @@index([tenantId])
+  @@map("document_series")
+}
+
+/// Generic on/off + config switches referenced in BRD 5.1 ("Company
+/// policies for inventory, purchase, approvals, posting, document
+/// numbering, security, and period closing"). Kept as flexible key/value
+/// rows instead of one column per policy so new policies don't need a
+/// migration - policyValue holds a JSON scalar (true/false, a number, or a
+/// short string) depending on policyKey.
+model CompanyPolicy {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  companyId   String   @map("company_id")
+  policyKey   String   @map("policy_key") // e.g. "allowNegativeStock", "approvalAmountLimit", "poGrnInvoiceTolerancePct"
+  policyValue Json     @map("policy_value")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  company     Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([tenantId, companyId, policyKey])
+  @@index([tenantId])
+  @@map("company_policies")
+}
+
+// ============================================================================
+// 3. SECURITY
+// ============================================================================
+
+model User {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  email             String
+  mobile            String?
+  displayName       String   @map("display_name")
+  passwordHash      String   @map("password_hash")
+  linkedEmployeeId  String?  @map("linked_employee_id")
+  status            String   @default("Invited") // Invited|Active|Locked|Inactive
+  lastLoginAt       DateTime? @map("last_login_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant   @relation(fields: [tenantId], references: [id])
+  userRoles         UserRole[]
+  branchAccess      UserBranchAccess[]
+  warehouseAccess   UserWarehouseAccess[]
+  approvalTasks     ApprovalTask[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+model Role {
+  id       String   @id @default(uuid())
+  tenantId String   @map("tenant_id")
+  code     String
+  name     String
+  status   String   @default("Active")
+
+  tenant           Tenant @relation(fields: [tenantId], references: [id])
+  rolePermissions  RolePermission[]
+  userRoles        UserRole[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+/// Global permission catalog (module/screen/action) - not tenant scoped.
+model Permission {
+  id          String   @id @default(uuid())
+  moduleCode  String   @map("module_code")
+  screenCode  String   @map("screen_code")
+  actionCode  String   @map("action_code") // View|Create|Edit|Submit|Approve|Reject|Post|Cancel|Reopen|Print|Export|Import|Override
+
+  rolePermissions RolePermission[]
+
+  @@unique([moduleCode, screenCode, actionCode])
+  @@map("permissions")
+}
+
+model RolePermission {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  roleId       String   @map("role_id")
+  permissionId String   @map("permission_id")
+  allowed      Boolean  @default(true)
+
+  tenant       Tenant     @relation(fields: [tenantId], references: [id])
+  role         Role       @relation(fields: [roleId], references: [id])
+  permission   Permission @relation(fields: [permissionId], references: [id])
+
+  @@unique([tenantId, roleId, permissionId])
+  @@index([tenantId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  companyId String?  @map("company_id")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+  role      Role     @relation(fields: [roleId], references: [id])
+
+  @@unique([tenantId, userId, roleId, companyId])
+  @@index([tenantId])
+  @@map("user_roles")
+}
+
+model UserBranchAccess {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  userId   String @map("user_id")
+  branchId String @map("branch_id")
+
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  user     User   @relation(fields: [userId], references: [id])
+  branch   Branch @relation(fields: [branchId], references: [id])
+
+  @@unique([tenantId, userId, branchId])
+  @@index([tenantId])
+  @@map("user_branch_access")
+}
+
+model UserWarehouseAccess {
+  id          String    @id @default(uuid())
+  tenantId    String    @map("tenant_id")
+  userId      String    @map("user_id")
+  warehouseId String    @map("warehouse_id")
+
+  tenant      Tenant    @relation(fields: [tenantId], references: [id])
+  user        User      @relation(fields: [userId], references: [id])
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([tenantId, userId, warehouseId])
+  @@index([tenantId])
+  @@map("user_warehouse_access")
+}
+
+/// Append-only security / transaction audit trail.
+model AuditLog {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  userId       String?  @map("user_id")
+  moduleCode   String   @map("module_code")
+  recordTable  String   @map("record_table")
+  recordId     String   @map("record_id")
+  action       String   // Created|Edited|Submitted|Approved|Posted|Cancelled|Reopened
+  oldValueJson Json?    @map("old_value_json")
+  newValueJson Json?    @map("new_value_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  user         User?    @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, moduleCode, recordId])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// 4. MASTERS (country/city/area, currency, tax, UOM, terms, payment methods)
+// ============================================================================
+
+/// Global reference list (not tenant-scoped) - same country list for every
+/// tenant, matching how currencies work. City -> Area hangs off this for
+/// address fields (company, branch, vendor, customer).
+model Country {
+  id   String @id @default(uuid())
+  code String @unique // ISO 3166-1 alpha-2, e.g. AE, US
+  name String
+
+  cities    City[]
+  customers Customer[]
+  vendors   Vendor[]
+
+  @@map("countries")
+}
+
+/// Global reference list of cities per country.
+model City {
+  id        String  @id @default(uuid())
+  countryId String  @map("country_id")
+  code      String
+  name      String
+
+  country   Country @relation(fields: [countryId], references: [id])
+  areas     Area[]
+  customers Customer[]
+  vendors   Vendor[]
+
+  @@unique([countryId, code])
+  @@map("cities")
+}
+
+///// Tenant-scoped: each restaurant group defines its own delivery
+/// zones/areas within a city (used for branch address, delivery radius,
+/// customer/vendor address). Unlike Country/City this is NOT shared across
+/// tenants since zone boundaries are business-specific.
+model Area {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  cityId   String  @map("city_id")
+  code     String
+  name     String
+  status   String  @default("Active")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  city      City       @relation(fields: [cityId], references: [id])
+  customers Customer[]
+  vendors   Vendor[]
+
+  @@unique([tenantId, cityId, code])
+  @@index([tenantId])
+  @@map("areas")
+}
+
+model Currency {
+  id               String @id @default(uuid())
+  code             String @unique // ISO 4217, e.g. AED, USD
+  name             String
+  decimalPrecision Int    @default(2) @map("decimal_precision")
+
+  vendors Vendor[]
+
+  @@map("currencies")
+}
+
+model Tax {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  code     String
+  name     String
+  rate     Decimal @db.Decimal(9, 4)
+  taxType  String  @default("VAT") @map("tax_type")
+  taxGroup String  @default("Standard rate") @map("tax_group") // Standard rate|Zero rated|Exempt
+  status   String  @default("Active")
+
+  tenant   Tenant  @relation(fields: [tenantId], references: [id])
+
+  poLines       PurchaseOrderLine[]
+  salesLines    SalesInvoiceLine[]
+  posMappings   PosItemMapping[]
+  itemsAsDefaultTax Item[]
+  salesQuoteLines   SalesQuoteLine[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("taxes")
+}
+
+model Uom {
+  id               String @id @default(uuid())
+  tenantId         String @map("tenant_id")
+  code             String
+  name             String
+  decimalPrecision Int    @default(3) @map("decimal_precision")
+
+  tenant           Tenant @relation(fields: [tenantId], references: [id])
+
+  itemsAsBase      Item[]
+  itemsAsPurchaseUom Item[] @relation("ItemPurchaseUom")
+  itemsAsSalesUom  Item[] @relation("ItemSalesUom")
+  conversionsFrom  UomConversion[] @relation("UomFrom")
+  conversionsTo    UomConversion[] @relation("UomTo")
+  mrLines          MaterialRequestLine[]
+  poLines          PurchaseOrderLine[]
+  recipeIngredients RecipeIngredient[]
+  rfqLines         RfqLine[]
+  salesQuoteLines  SalesQuoteLine[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("uoms")
+}
+
+model UomConversion {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  itemId        String?  @map("item_id") // null = generic conversion
+  fromUomId     String   @map("from_uom_id")
+  toUomId       String   @map("to_uom_id")
+  factor        Decimal  @default(1) @db.Decimal(18, 6)
+  effectiveFrom DateTime @default(now()) @map("effective_from")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  item          Item?    @relation(fields: [itemId], references: [id])
+  fromUom       Uom      @relation("UomFrom", fields: [fromUomId], references: [id])
+  toUom         Uom      @relation("UomTo", fields: [toUomId], references: [id])
+
+  @@index([tenantId, itemId])
+  @@map("uom_conversions")
+}
+
+model Term {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  days     Int    @default(0)
+  status   String @default("Active")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  vendors   Vendor[]
+  customers Customer[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("terms")
+}
+
+model PaymentMethod {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  type     String @default("Cash") // Cash|Card|Online|Aggregator|Cheque|Bank Transfer
+  status   String @default("Active")
+
+  tenant          Tenant @relation(fields: [tenantId], references: [id])
+  vendorPayments  VendorPayment[]
+  salesPayments   SalesPayment[]
+  customerReceipts CustomerReceipt[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("payment_methods")
+}
+
+/// Global reference list of banks (e.g. "Emirates NBD"), same idea as
+/// Country/Currency - shared across tenants. A tenant's own bank_accounts
+/// row optionally points at one of these instead of retyping the bank name.
+model Bank {
+  id   String @id @default(uuid())
+  code String @unique
+  name String
+
+  bankAccounts BankAccount[]
+
+  @@map("banks")
+}
+
+// ============================================================================
+// 5. PRODUCT CLASSIFICATION MASTERS (Group / Subgroup / Brand / Family, Menu)
+// ============================================================================
+// A separate, explicit classification hierarchy requested alongside the
+// existing self-referencing ItemCategory tree: Group -> Subgroup -> Family
+// are nested, Brand is an independent cross-cutting dimension, and Menu is
+// a POS-facing grouping (which products show up on which ordering menu) -
+// distinct from classification, so items can sit on more than one menu.
+
+model ProductGroup {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id])
+  subgroups  ProductSubgroup[]
+  items      Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("product_groups")
+}
+
+model ProductSubgroup {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  groupId  String @map("group_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant   Tenant       @relation(fields: [tenantId], references: [id])
+  group    ProductGroup @relation(fields: [groupId], references: [id])
+  families ProductFamily[]
+  items    Item[]
+
+  @@unique([tenantId, groupId, code])
+  @@index([tenantId])
+  @@map("product_subgroups")
+}
+
+model ProductFamily {
+  id         String  @id @default(uuid())
+  tenantId   String  @map("tenant_id")
+  subgroupId String? @map("subgroup_id")
+  code       String
+  name       String
+  status     String  @default("Active")
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id])
+  subgroup   ProductSubgroup? @relation(fields: [subgroupId], references: [id])
+  items      Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("product_families")
+}
+
+model Brand {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant   Tenant  @relation(fields: [tenantId], references: [id])
+  items    Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("brands")
+}
+
+/// POS/ordering menu (e.g. "Breakfast menu", "Delivery menu"). An item can
+/// appear on several menus, so this is a many-to-many via MenuItem, not a
+/// field on Item.
+model Menu {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant   Tenant     @relation(fields: [tenantId], references: [id])
+  items    MenuItem[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("menus")
+}
+
+model MenuItem {
+  id        String @id @default(uuid())
+  tenantId  String @map("tenant_id")
+  menuId    String @map("menu_id")
+  itemId    String @map("item_id")
+  sortOrder Int    @default(0) @map("sort_order")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id])
+  menu      Menu   @relation(fields: [menuId], references: [id])
+  item      Item   @relation(fields: [itemId], references: [id])
+
+  @@unique([tenantId, menuId, itemId])
+  @@index([tenantId])
+  @@map("menu_items")
+}
+
+// ============================================================================
+// 6. INVENTORY MASTERS
+// ============================================================================
+
+model ItemCategory {
+  id                    String   @id @default(uuid())
+  tenantId              String   @map("tenant_id")
+  parentId              String?  @map("parent_id")
+  code                  String
+  name                  String
+  defaultInventoryGlId  String?  @map("default_inventory_gl_id")
+  defaultCogsGlId       String?  @map("default_cogs_gl_id")
+  status                String   @default("Active")
+
+  tenant                Tenant       @relation(fields: [tenantId], references: [id])
+  parent                ItemCategory? @relation("CategoryParent", fields: [parentId], references: [id])
+  children              ItemCategory[] @relation("CategoryParent")
+  items                 Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("item_categories")
+}
+
+model Item {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  code            String
+  name            String
+  shortName       String?  @map("short_name") // print/receipt name, kept short for POS/kitchen tickets
+  barcode         String?
+  itemType        String   @map("item_type") // Sellable|Stock|Non-stock|Stationary|Menu|Semi-finished|Finished|Packaging|Service|Spare
+  categoryId      String?  @map("category_id")
+  groupId         String?  @map("group_id")
+  subgroupId      String?  @map("subgroup_id")
+  familyId        String?  @map("family_id")
+  brandId         String?  @map("brand_id")
+  baseUomId       String   @map("base_uom_id")
+  purchaseUomId   String?  @map("purchase_uom_id") // UOM used on purchase orders, if different from base
+  salesUomId      String?  @map("sales_uom_id")    // UOM used on sales/POS, if different from base
+  defaultTaxId    String?  @map("default_tax_id")
+  costingMethod   String   @default("Weighted Average") @map("costing_method") // Weighted Average|Standard Cost|FIFO
+  standardCost    Decimal? @db.Decimal(18, 6) @map("standard_cost")
+  batchRequired   Boolean  @default(false) @map("batch_required")
+  expiryRequired  Boolean  @default(false) @map("expiry_required")
+  shelfLifeDays   Int?     @map("shelf_life_days")
+  reorderLevel    Decimal? @db.Decimal(18, 3) @map("reorder_level")
+  minStock        Decimal? @db.Decimal(18, 3) @map("min_stock")
+  maxStock        Decimal? @db.Decimal(18, 3) @map("max_stock")
+  preparationTimeMinutes Int? @map("preparation_time_minutes") // kitchen prep time, relevant for Sellable/Menu items
+  allergens       String?  // free-text list for MVP, e.g. "Gluten, Nuts, Dairy"
+  imageUrl        String?  @map("image_url")
+  notes           String?
+  lastReceivedCost Decimal? @db.Decimal(18, 6) @map("last_received_cost") // unit cost from the most recent GRN, cached by the costing service
+  lastReceivedDate DateTime? @map("last_received_date")
+  averageCost      Decimal? @db.Decimal(18, 6) @map("average_cost") // weighted-average cost across all warehouses, cached by the costing service from stock_balances - always rebuildable from stock_ledger
+  status          String   @default("Draft") // Draft|Active|Inactive
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant          Tenant       @relation(fields: [tenantId], references: [id])
+  category        ItemCategory? @relation(fields: [categoryId], references: [id])
+  group           ProductGroup? @relation(fields: [groupId], references: [id])
+  subgroup        ProductSubgroup? @relation(fields: [subgroupId], references: [id])
+  family          ProductFamily? @relation(fields: [familyId], references: [id])
+  brand           Brand? @relation(fields: [brandId], references: [id])
+  baseUom         Uom          @relation(fields: [baseUomId], references: [id])
+  purchaseUom     Uom?         @relation("ItemPurchaseUom", fields: [purchaseUomId], references: [id])
+  salesUom        Uom?         @relation("ItemSalesUom", fields: [salesUomId], references: [id])
+  defaultTax      Tax?         @relation(fields: [defaultTaxId], references: [id])
+
+  glMapping           ItemGlMapping?
+  prices               ItemPrice[]
+  vendorMappings        ItemVendorMapping[]
+  uomConversions        UomConversion[]
+  stockLedgerEntries    StockLedger[]
+  stockBalances         StockBalance[]
+  mrLines               MaterialRequestLine[]
+  mrConsolidationLines  MrConsolidationLine[]
+  rfqLines              RfqLine[]
+  poLines               PurchaseOrderLine[]
+  grnLines              GrnLine[]
+  goodsReturnLines      GoodsReturnLine[]
+  stockTransferLines    StockTransferLine[]
+  stockAdjustmentLines  StockAdjustmentLine[]
+  recipesAsOutput       Recipe[]
+  recipeIngredients     RecipeIngredient[]
+  posItemMappings       PosItemMapping[]
+  salesInvoiceLines     SalesInvoiceLine[]
+  consumptionLines      ConsumptionLine[]
+  menuItems             MenuItem[]
+  salesQuoteLines       SalesQuoteLine[]
+  deliveryOrderLines    DeliveryOrderLine[]
+  salesReturnLines      SalesReturnLine[]
+  productionPostingLines ProductionPostingLine[]
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("items")
+}
+
+model ItemGlMapping {
+  id           String  @id @default(uuid())
+  tenantId     String  @map("tenant_id")
+  itemId       String  @unique @map("item_id")
+  inventoryGlId String? @map("inventory_gl_id")
+  cogsGlId     String? @map("cogs_gl_id")
+  revenueGlId  String? @map("revenue_gl_id")
+  expenseGlId  String? @map("expense_gl_id")
+  wastageGlId  String? @map("wastage_gl_id")
+
+  tenant       Tenant  @relation(fields: [tenantId], references: [id])
+  item         Item    @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId])
+  @@map("item_gl_mappings")
+}
+
+model ItemPrice {
+  id               String    @id @default(uuid())
+  tenantId         String    @map("tenant_id")
+  itemId           String    @map("item_id")
+  branchId         String?   @map("branch_id")
+  channelId        String?   @map("channel_id")
+  customerGroupId  String?   @map("customer_group_id")
+  price            Decimal   @default(0) @db.Decimal(18, 3)
+  effectiveFrom    DateTime  @default(now()) @map("effective_from")
+  effectiveTo      DateTime? @map("effective_to")
+
+  tenant           Tenant    @relation(fields: [tenantId], references: [id])
+  item             Item      @relation(fields: [itemId], references: [id])
+  branch           Branch?   @relation(fields: [branchId], references: [id])
+  channel          SalesChannel? @relation(fields: [channelId], references: [id])
+
+  @@index([tenantId, itemId])
+  @@map("item_prices")
+}
+
+model ItemVendorMapping {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  itemId         String   @map("item_id")
+  vendorId       String   @map("vendor_id")
+  vendorItemCode String?  @map("vendor_item_code")
+  leadTimeDays   Int?     @map("lead_time_days")
+  lastPrice      Decimal? @db.Decimal(18, 3) @map("last_price")
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  item           Item     @relation(fields: [itemId], references: [id])
+  vendor         Vendor   @relation(fields: [vendorId], references: [id])
+
+  @@unique([tenantId, itemId, vendorId])
+  @@index([tenantId])
+  @@map("item_vendor_mappings")
+}
+
+/// Append-only inventory movement ledger. Never updated/deleted; corrections
+/// are new offsetting rows created by reversal/adjustment documents.
+model StockLedger {
+  id            String    @id @default(uuid())
+  tenantId      String    @map("tenant_id")
+  itemId        String    @map("item_id")
+  warehouseId   String    @map("warehouse_id")
+  batchNo       String?   @map("batch_no")
+  expiryDate    DateTime? @map("expiry_date")
+  movementDate  DateTime  @map("movement_date")
+  qtyIn         Decimal   @default(0) @db.Decimal(18, 3) @map("qty_in")
+  qtyOut        Decimal   @default(0) @db.Decimal(18, 3) @map("qty_out")
+  unitCost      Decimal   @default(0) @db.Decimal(18, 6) @map("unit_cost")
+  sourceModule  String    @map("source_module") // Procurement|InventoryOps|Consumption|Sales
+  sourceDocType String?   @map("source_doc_type") // GRN|IBT|Issue|Adjustment|StockTake|Consumption|Return
+  sourceDocId   String    @map("source_doc_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  tenant        Tenant    @relation(fields: [tenantId], references: [id])
+  item          Item      @relation(fields: [itemId], references: [id])
+  warehouse     Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@index([tenantId, itemId, warehouseId, movementDate])
+  @@index([sourceModule, sourceDocId])
+  @@map("stock_ledger")
+}
+
+/// Materialized current balance, maintained by the posting service from
+/// stock_ledger. Can always be rebuilt by replaying the ledger.
+model StockBalance {
+  id          String    @id @default(uuid())
+  tenantId    String    @map("tenant_id")
+  itemId      String    @map("item_id")
+  warehouseId String    @map("warehouse_id")
+  batchNo     String    @default("") @map("batch_no")
+  expiryDate  DateTime? @map("expiry_date")
+  quantity    Decimal   @default(0) @db.Decimal(18, 3)
+  value       Decimal   @default(0) @db.Decimal(18, 3)
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenant      Tenant    @relation(fields: [tenantId], references: [id])
+  item        Item      @relation(fields: [itemId], references: [id])
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([tenantId, itemId, warehouseId, batchNo, expiryDate])
+  @@map("stock_balances")
+}
+
+/// Corrects stock on hand outside the normal purchase/consumption/transfer
+/// flows - physical count variances, damage, expiry write-offs, theft/loss.
+/// Each line's adjustQty is signed: positive = stock found (posts qtyIn),
+/// negative = stock written off (posts qtyOut). Posts the variance value to
+/// a dedicated Stock Adjustment GL account against Inventory Asset.
+model StockAdjustment {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  adjustmentNo   String   @map("adjustment_no")
+  branchId       String   @map("branch_id")
+  warehouseId    String   @map("warehouse_id")
+  adjustmentDate DateTime @default(now()) @map("adjustment_date")
+  reason         String   // Physical Count|Damage|Expiry|Theft or Loss|Other
+  status         String   @default("Draft") // Draft|Submitted|Approved|Posted|Cancelled
+  approvedBy     String?  @map("approved_by")
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant    @relation(fields: [tenantId], references: [id])
+  branch         Branch    @relation(fields: [branchId], references: [id])
+  warehouse      Warehouse @relation(fields: [warehouseId], references: [id])
+
+  lines          StockAdjustmentLine[]
+
+  @@unique([tenantId, adjustmentNo])
+  @@index([tenantId])
+  @@map("stock_adjustments")
+}
+
+model StockAdjustmentLine {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  adjustmentId String   @map("adjustment_id")
+  itemId       String   @map("item_id")
+  batchNo      String?  @map("batch_no")
+  systemQty    Decimal  @default(0) @db.Decimal(18, 3) @map("system_qty") // snapshot of stock_balances qty when the line was added
+  countedQty   Decimal? @db.Decimal(18, 3) @map("counted_qty") // physical count use case; adjustQty = countedQty - systemQty when set
+  adjustQty    Decimal  @db.Decimal(18, 3) @map("adjust_qty") // signed: positive = increase (found), negative = decrease (written off)
+  unitCost     Decimal? @db.Decimal(18, 6) @map("unit_cost") // used only when adjustQty > 0; decreases always cost out at the item's current average cost
+
+  tenant       Tenant          @relation(fields: [tenantId], references: [id])
+  adjustment   StockAdjustment @relation(fields: [adjustmentId], references: [id])
+  item         Item            @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId, adjustmentId])
+  @@map("stock_adjustment_lines")
+}
+
+// ============================================================================
+// 6. PROCUREMENT
+// ============================================================================
+
+model Vendor {
+  id                    String    @id @default(uuid())
+  tenantId              String    @map("tenant_id")
+  code                  String
+  name                  String
+  contactPerson         String?   @map("contact_person")
+  phone                 String?
+  whatsapp              String?
+  email                 String?
+  address               String?
+  countryId             String?   @map("country_id")
+  cityId                String?   @map("city_id")
+  areaId                String?   @map("area_id")
+  taxNo                 String?   @map("tax_no")
+  tradeLicenseNo        String?   @map("trade_license_no")
+  licenseExpiryDate     DateTime? @map("license_expiry_date")
+  currencyId            String?   @map("currency_id")
+  paymentTermsId        String?   @map("payment_terms_id")
+  creditLimit           Decimal?  @db.Decimal(18, 3) @map("credit_limit")
+  bankName              String?   @map("bank_name")
+  bankAccountNo         String?   @map("bank_account_no")
+  iban                  String?
+  rating                String    @default("Pending") @map("rating") // Approved|Pending|Blacklisted
+  payableGlId           String?   @map("payable_gl_id")
+  notes                 String?
+  status                String    @default("Draft")
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  country         Country? @relation(fields: [countryId], references: [id])
+  city            City?    @relation(fields: [cityId], references: [id])
+  area            Area?    @relation(fields: [areaId], references: [id])
+  currency        Currency? @relation(fields: [currencyId], references: [id])
+  paymentTerms    Term?    @relation(fields: [paymentTermsId], references: [id])
+
+  documents         VendorDocument[]
+  itemMappings       ItemVendorMapping[]
+  rfqQuotes           RfqVendorQuote[]
+  purchaseOrders      PurchaseOrder[]
+  grns                Grn[]
+  goodsReturns        GoodsReturn[]
+  purchaseInvoices    PurchaseInvoice[]
+  debitNotes          VendorDebitNote[]
+  vendorPayments      VendorPayment[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("vendors")
+}
+
+model VendorDocument {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  vendorId       String    @map("vendor_id")
+  documentTypeId String    @map("document_type_id")
+  issueDate      DateTime? @map("issue_date")
+  expiryDate     DateTime? @map("expiry_date")
+  status         String    @default("Active")
+  fileRef        String?   @map("file_ref")
+
+  tenant         Tenant       @relation(fields: [tenantId], references: [id])
+  vendor         Vendor       @relation(fields: [vendorId], references: [id])
+  documentType   DocumentType @relation(fields: [documentTypeId], references: [id])
+
+  @@index([tenantId, vendorId])
+  @@map("vendor_documents")
+}
+
+model MaterialRequest {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  branchId     String   @map("branch_id")
+  warehouseId  String?  @map("warehouse_id")
+  requesterId  String?  @map("requester_id")
+  sourceType   String   @default("Branch") @map("source_type") // Branch|Warehouse|CentralKitchen|Direct
+  mrNo         String   @map("mr_no")
+  requestDate  DateTime @default(now()) @map("request_date")
+  requiredDate DateTime? @map("required_date")
+  status       String   @default("Draft") // Draft|Submitted|Approved|Rejected|Closed|Cancelled
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  branch       Branch    @relation(fields: [branchId], references: [id])
+  warehouse    Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  lines             MaterialRequestLine[]
+  consolidationLines MrConsolidationLine[]
+  poLines            PurchaseOrderLine[]
+
+  @@unique([tenantId, mrNo])
+  @@index([tenantId])
+  @@map("material_requests")
+}
+
+model MaterialRequestLine {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  mrId          String   @map("mr_id")
+  itemId        String   @map("item_id")
+  requestedQty  Decimal  @db.Decimal(18, 3) @map("requested_qty")
+  approvedQty   Decimal? @db.Decimal(18, 3) @map("approved_qty")
+  uomId         String   @map("uom_id")
+  requiredDate  DateTime? @map("required_date")
+
+  tenant        Tenant           @relation(fields: [tenantId], references: [id])
+  mr            MaterialRequest  @relation(fields: [mrId], references: [id])
+  item          Item             @relation(fields: [itemId], references: [id])
+  uom           Uom              @relation(fields: [uomId], references: [id])
+
+  consolidationLines MrConsolidationLine[]
+  poLines            PurchaseOrderLine[]
+  rfqLines           RfqLine[]
+
+  @@index([tenantId, mrId])
+  @@map("material_request_lines")
+}
+
+model MrConsolidation {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  consolidationNo   String   @map("consolidation_no")
+  consolidationDate DateTime @default(now()) @map("consolidation_date")
+  // External = the consolidated qty gets bought (feeds an RFQ/PO).
+  // Internal = the consolidated qty gets pulled from another branch's stock
+  // instead of buying (feeds an inter-branch transfer). Lines can be picked
+  // from MRs across every branch, which is what makes a head-office
+  // consolidation useful in the first place - see
+  // GET /material-requests/consolidation-pool.
+  fulfillmentType   String   @default("External") @map("fulfillment_type") // External|Internal
+  status            String   @default("Draft")
+
+  tenant            Tenant   @relation(fields: [tenantId], references: [id])
+  lines             MrConsolidationLine[]
+  stockTransfers    StockTransfer[]
+
+  @@unique([tenantId, consolidationNo])
+  @@index([tenantId])
+  @@map("mr_consolidations")
+}
+
+model MrConsolidationLine {
+  id               String   @id @default(uuid())
+  tenantId         String   @map("tenant_id")
+  consolidationId  String   @map("consolidation_id")
+  mrId             String?  @map("mr_id")
+  mrLineId         String   @map("mr_line_id")
+  itemId           String   @map("item_id")
+  qty              Decimal  @db.Decimal(18, 3)
+
+  tenant           Tenant          @relation(fields: [tenantId], references: [id])
+  consolidation    MrConsolidation @relation(fields: [consolidationId], references: [id])
+  mr               MaterialRequest? @relation(fields: [mrId], references: [id])
+  mrLine           MaterialRequestLine @relation(fields: [mrLineId], references: [id])
+  item             Item            @relation(fields: [itemId], references: [id])
+
+  stockTransferLines StockTransferLine[]
+
+  @@index([tenantId, consolidationId])
+  @@map("mr_consolidation_lines")
+}
+
+/// Inter-branch transfer (IBT) - moves stock from one branch/warehouse's
+/// balance to another's, e.g. as the "Internal" fulfillment path for a
+/// head-office MR consolidation instead of buying externally. Posting has
+/// two real legs, not just a status label: Transfer Out removes stock from
+/// the source warehouse and lands it in a dedicated in-transit warehouse
+/// (so "goods on the way" show up as an actual, queryable stock balance,
+/// not just a document status); Transfer In moves it out of in-transit and
+/// into the destination warehouse once it arrives. The unit cost captured
+/// at Transfer Out is carried through both legs unchanged.
+model StockTransfer {
+  id                    String   @id @default(uuid())
+  tenantId              String   @map("tenant_id")
+  transferNo            String   @map("transfer_no")
+  fromBranchId          String   @map("from_branch_id")
+  toBranchId            String   @map("to_branch_id")
+  fromWarehouseId       String   @map("from_warehouse_id")
+  toWarehouseId         String   @map("to_warehouse_id")
+  transitWarehouseId    String   @map("transit_warehouse_id") // must be a Warehouse with isInTransit = true
+  sourceConsolidationId String?  @map("source_consolidation_id")
+  transferDate          DateTime @default(now()) @map("transfer_date")
+  status                String   @default("Draft") // Draft|Submitted|Approved|InTransit|Received|Cancelled
+  notes                 String?
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  tenant                Tenant           @relation(fields: [tenantId], references: [id])
+  fromBranch            Branch           @relation("StockTransferFromBranch", fields: [fromBranchId], references: [id])
+  toBranch              Branch           @relation("StockTransferToBranch", fields: [toBranchId], references: [id])
+  fromWarehouse         Warehouse        @relation("StockTransferFromWarehouse", fields: [fromWarehouseId], references: [id])
+  toWarehouse           Warehouse        @relation("StockTransferToWarehouse", fields: [toWarehouseId], references: [id])
+  transitWarehouse      Warehouse        @relation("StockTransferTransitWarehouse", fields: [transitWarehouseId], references: [id])
+  sourceConsolidation   MrConsolidation? @relation(fields: [sourceConsolidationId], references: [id])
+
+  lines                 StockTransferLine[]
+
+  @@unique([tenantId, transferNo])
+  @@index([tenantId])
+  @@map("stock_transfers")
+}
+
+model StockTransferLine {
+  id                          String   @id @default(uuid())
+  tenantId                    String   @map("tenant_id")
+  transferId                  String   @map("transfer_id")
+  itemId                      String   @map("item_id")
+  qty                         Decimal  @db.Decimal(18, 3)
+  batchNo                     String?  @map("batch_no")
+  unitCost                    Decimal  @default(0) @db.Decimal(18, 6) @map("unit_cost") // captured at dispatch, carried through to receipt
+  sourceMrConsolidationLineId String?  @map("source_mr_consolidation_line_id")
+
+  tenant                      Tenant               @relation(fields: [tenantId], references: [id])
+  transfer                    StockTransfer        @relation(fields: [transferId], references: [id])
+  item                        Item                 @relation(fields: [itemId], references: [id])
+  sourceMrConsolidationLine   MrConsolidationLine?  @relation(fields: [sourceMrConsolidationLineId], references: [id])
+
+  @@index([tenantId, transferId])
+  @@map("stock_transfer_lines")
+}
+
+/// Request for Quotation - not in the original blueprint, added at the
+/// user's request as a step between MR consolidation and PO: send the same
+/// line items to several vendors, capture what each quotes, then convert
+/// the selected quotes into a PO (see RfqVendorQuote.isSelected).
+model Rfq {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  rfqNo     String   @map("rfq_no")
+  branchId  String?  @map("branch_id")
+  rfqDate   DateTime @default(now()) @map("rfq_date")
+  status    String   @default("Draft") // Draft|Sent|Closed|Cancelled
+  notes     String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  branch    Branch?  @relation(fields: [branchId], references: [id])
+
+  lines     RfqLine[]
+  quotes    RfqVendorQuote[]
+
+  @@unique([tenantId, rfqNo])
+  @@index([tenantId])
+  @@map("rfqs")
+}
+
+model RfqLine {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  rfqId          String   @map("rfq_id")
+  itemId         String   @map("item_id")
+  qty            Decimal  @db.Decimal(18, 3)
+  uomId          String   @map("uom_id")
+  sourceMrLineId String?  @map("source_mr_line_id")
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  rfq            Rfq      @relation(fields: [rfqId], references: [id])
+  item           Item     @relation(fields: [itemId], references: [id])
+  uom            Uom      @relation(fields: [uomId], references: [id])
+  sourceMrLine   MaterialRequestLine? @relation(fields: [sourceMrLineId], references: [id])
+
+  quotes         RfqVendorQuote[]
+  poLines        PurchaseOrderLine[]
+
+  @@index([tenantId, rfqId])
+  @@map("rfq_lines")
+}
+
+/// One vendor's quoted price/lead time against one RFQ line. isSelected
+/// marks the winning quote that gets converted into a PO line.
+model RfqVendorQuote {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  rfqId         String   @map("rfq_id")
+  rfqLineId     String   @map("rfq_line_id")
+  vendorId      String   @map("vendor_id")
+  quotedPrice   Decimal  @db.Decimal(18, 3) @map("quoted_price")
+  leadTimeDays  Int?     @map("lead_time_days")
+  isSelected    Boolean  @default(false) @map("is_selected")
+  notes         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  rfq           Rfq      @relation(fields: [rfqId], references: [id])
+  rfqLine       RfqLine  @relation(fields: [rfqLineId], references: [id])
+  vendor        Vendor   @relation(fields: [vendorId], references: [id])
+
+  @@unique([rfqLineId, vendorId])
+  @@index([tenantId, rfqId])
+  @@map("rfq_vendor_quotes")
+}
+
+model PurchaseOrder {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  poNo           String   @map("po_no")
+  vendorId       String   @map("vendor_id")
+  branchId       String   @map("branch_id")
+  poDate         DateTime @default(now()) @map("po_date")
+  status         String   @default("Draft") // Draft|Submitted|Approved|Partially Received|Closed|Cancelled
+  approvalStatus String   @default("Pending") @map("approval_status")
+  totalAmount    Decimal  @default(0) @db.Decimal(18, 3) @map("total_amount")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  vendor         Vendor   @relation(fields: [vendorId], references: [id])
+  branch         Branch   @relation(fields: [branchId], references: [id])
+
+  lines          PurchaseOrderLine[]
+  grns           Grn[]
+
+  @@unique([tenantId, poNo])
+  @@index([tenantId])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  poId           String   @map("po_id")
+  itemId         String   @map("item_id")
+  qty            Decimal  @db.Decimal(18, 3)
+  uomId          String   @map("uom_id")
+  unitPrice      Decimal  @db.Decimal(18, 3) @map("unit_price")
+  taxId          String?  @map("tax_id")
+  sourceMrId     String?  @map("source_mr_id")
+  sourceMrLineId String?  @map("source_mr_line_id")
+  sourceRfqLineId String? @map("source_rfq_line_id")
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  po             PurchaseOrder @relation(fields: [poId], references: [id])
+  item           Item     @relation(fields: [itemId], references: [id])
+  uom            Uom      @relation(fields: [uomId], references: [id])
+  tax            Tax?     @relation(fields: [taxId], references: [id])
+  sourceMr       MaterialRequest? @relation(fields: [sourceMrId], references: [id])
+  sourceMrLine   MaterialRequestLine? @relation(fields: [sourceMrLineId], references: [id])
+  sourceRfqLine  RfqLine? @relation(fields: [sourceRfqLineId], references: [id])
+
+  grnLines       GrnLine[]
+
+  @@index([tenantId, poId])
+  @@map("purchase_order_lines")
+}
+
+model Grn {
+  id         String   @id @default(uuid())
+  tenantId   String   @map("tenant_id")
+  grnNo      String   @map("grn_no")
+  poId       String?  @map("po_id")
+  vendorId   String   @map("vendor_id")
+  branchId   String   @map("branch_id")
+  warehouseId String  @map("warehouse_id")
+  grnDate    DateTime @default(now()) @map("grn_date")
+  status     String   @default("Draft") // Draft|Posted|Cancelled
+  qcStatus   String   @default("Pending") @map("qc_status") // Pending|Accepted|Rejected|OnHold
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant    @relation(fields: [tenantId], references: [id])
+  po         PurchaseOrder? @relation(fields: [poId], references: [id])
+  vendor     Vendor    @relation(fields: [vendorId], references: [id])
+  branch     Branch    @relation(fields: [branchId], references: [id])
+  warehouse  Warehouse @relation(fields: [warehouseId], references: [id])
+
+  lines             GrnLine[]
+  purchaseInvoices  PurchaseInvoiceGrn[]
+  goodsReturns      GoodsReturn[]
+
+  @@unique([tenantId, grnNo])
+  @@index([tenantId])
+  @@map("grns")
+}
+
+model GrnLine {
+  id           String    @id @default(uuid())
+  tenantId     String    @map("tenant_id")
+  grnId        String    @map("grn_id")
+  poLineId     String?   @map("po_line_id")
+  itemId       String    @map("item_id")
+  receivedQty  Decimal   @db.Decimal(18, 3) @map("received_qty")
+  acceptedQty  Decimal   @db.Decimal(18, 3) @map("accepted_qty")
+  rejectedQty  Decimal   @default(0) @db.Decimal(18, 3) @map("rejected_qty")
+  batchNo      String?   @map("batch_no")
+  expiryDate   DateTime? @map("expiry_date")
+  unitCost     Decimal   @default(0) @db.Decimal(18, 6) @map("unit_cost")
+
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  grn          Grn       @relation(fields: [grnId], references: [id])
+  poLine       PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
+  item         Item      @relation(fields: [itemId], references: [id])
+
+  goodsReturnLines GoodsReturnLine[]
+
+  @@index([tenantId, grnId])
+  @@map("grn_lines")
+}
+
+/// Goods Return (GRV) - return accepted/rejected goods to a vendor, per
+/// SRS/Screen Spec: "Return goods to vendor ... return no, GRN/vendor,
+/// branch, date, reason, status ... return qty cannot exceed available
+/// accepted qty. Posts negative stock and debit note if invoiced."
+model GoodsReturn {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  returnNo    String   @map("return_no")
+  grnId       String?  @map("grn_id")
+  vendorId    String   @map("vendor_id")
+  branchId    String   @map("branch_id")
+  warehouseId String   @map("warehouse_id")
+  returnDate  DateTime @default(now()) @map("return_date")
+  reason      String?
+  status      String   @default("Draft") // Draft|Posted|Cancelled
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant    @relation(fields: [tenantId], references: [id])
+  grn         Grn?      @relation(fields: [grnId], references: [id])
+  vendor      Vendor    @relation(fields: [vendorId], references: [id])
+  branch      Branch    @relation(fields: [branchId], references: [id])
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  lines       GoodsReturnLine[]
+  debitNotes  VendorDebitNote[]
+
+  @@unique([tenantId, returnNo])
+  @@index([tenantId])
+  @@map("goods_returns")
+}
+
+model GoodsReturnLine {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  goodsReturnId String   @map("goods_return_id")
+  grnLineId     String?  @map("grn_line_id")
+  itemId        String   @map("item_id")
+  batchNo       String?  @map("batch_no")
+  returnQty     Decimal  @db.Decimal(18, 3) @map("return_qty")
+  unitCost      Decimal  @default(0) @db.Decimal(18, 6) @map("unit_cost")
+  reason        String?
+
+  tenant        Tenant      @relation(fields: [tenantId], references: [id])
+  goodsReturn   GoodsReturn @relation(fields: [goodsReturnId], references: [id])
+  grnLine       GrnLine?    @relation(fields: [grnLineId], references: [id])
+  item          Item        @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId, goodsReturnId])
+  @@map("goods_return_lines")
+}
+
+/// Debit note against a vendor - issued when the returned goods had already
+/// been invoiced, reducing the vendor's payable balance (per Screen Spec:
+/// "Posts negative stock and debit note if invoiced").
+model VendorDebitNote {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  debitNoteNo       String   @map("debit_note_no")
+  vendorId          String   @map("vendor_id")
+  goodsReturnId     String?  @map("goods_return_id")
+  purchaseInvoiceId String?  @map("purchase_invoice_id")
+  amount            Decimal  @db.Decimal(18, 3)
+  postingStatus     String   @default("Draft") @map("posting_status") // Draft|Posted|Cancelled
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant           @relation(fields: [tenantId], references: [id])
+  vendor            Vendor           @relation(fields: [vendorId], references: [id])
+  goodsReturn       GoodsReturn?     @relation(fields: [goodsReturnId], references: [id])
+  purchaseInvoice   PurchaseInvoice? @relation(fields: [purchaseInvoiceId], references: [id])
+
+  @@unique([tenantId, debitNoteNo])
+  @@index([tenantId])
+  @@map("vendor_debit_notes")
+}
+
+model PurchaseInvoice {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  vendorId      String   @map("vendor_id")
+  invoiceNo     String   @map("invoice_no")
+  invoiceDate   DateTime @default(now()) @map("invoice_date")
+  gross         Decimal  @default(0) @db.Decimal(18, 3)
+  tax           Decimal  @default(0) @db.Decimal(18, 3)
+  net           Decimal  @default(0) @db.Decimal(18, 3)
+  postingStatus String   @default("Draft") @map("posting_status") // Draft|Submitted|Posted|Cancelled
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  vendor        Vendor   @relation(fields: [vendorId], references: [id])
+
+  grns          PurchaseInvoiceGrn[]
+  payments      VendorPaymentInvoice[]
+  debitNotes    VendorDebitNote[]
+
+  @@unique([tenantId, vendorId, invoiceNo])
+  @@index([tenantId])
+  @@map("purchase_invoices")
+}
+
+/// One invoice may cover multiple GRNs (N:N bridge).
+model PurchaseInvoiceGrn {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  purchaseInvoiceId String   @map("purchase_invoice_id")
+  grnId             String   @map("grn_id")
+
+  tenant            Tenant          @relation(fields: [tenantId], references: [id])
+  purchaseInvoice   PurchaseInvoice @relation(fields: [purchaseInvoiceId], references: [id])
+  grn               Grn             @relation(fields: [grnId], references: [id])
+
+  @@unique([purchaseInvoiceId, grnId])
+  @@index([tenantId])
+  @@map("purchase_invoice_grns")
+}
+
+model VendorPayment {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  vendorId        String   @map("vendor_id")
+  paymentNo       String   @map("payment_no")
+  paymentDate     DateTime @default(now()) @map("payment_date")
+  amount          Decimal  @db.Decimal(18, 3)
+  paymentMethodId String   @map("payment_method_id")
+  bankAccountId   String?  @map("bank_account_id")
+  // Invoice = settles one or more purchase invoices (invoices[] required).
+  // Advance = a prepayment to the vendor ahead of any invoice - posts
+  // Dr Vendor Advance (asset) / Cr Bank-Cash instead, per BRD 5.9
+  // "vendor advance".
+  mode            String   @default("Invoice") @map("mode") // Invoice|Advance
+  postingStatus   String   @default("Draft") @map("posting_status")
+  // Cheque register fields (BRD 5.9 "banking, contra, cheque register") -
+  // only meaningful when paymentMethod.type is "Cheque"; null otherwise.
+  chequeNo        String?  @map("cheque_no")
+  chequeDate      DateTime? @map("cheque_date")
+  chequeStatus    String?  @map("cheque_status") // Issued|Cleared|Bounced|Cancelled
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  vendor          Vendor   @relation(fields: [vendorId], references: [id])
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+  bankAccount     BankAccount?  @relation(fields: [bankAccountId], references: [id])
+
+  invoices        VendorPaymentInvoice[]
+
+  @@unique([tenantId, paymentNo])
+  @@index([tenantId])
+  @@map("vendor_payments")
+}
+
+/// Allocation of a (possibly multi-invoice) vendor payment across invoices.
+model VendorPaymentInvoice {
+  id                String  @id @default(uuid())
+  tenantId          String  @map("tenant_id")
+  vendorPaymentId   String  @map("vendor_payment_id")
+  purchaseInvoiceId String  @map("purchase_invoice_id")
+  appliedAmount     Decimal @db.Decimal(18, 3) @map("applied_amount")
+
+  tenant            Tenant          @relation(fields: [tenantId], references: [id])
+  vendorPayment     VendorPayment   @relation(fields: [vendorPaymentId], references: [id])
+  purchaseInvoice   PurchaseInvoice @relation(fields: [purchaseInvoiceId], references: [id])
+
+  @@index([tenantId])
+  @@map("vendor_payment_invoices")
+}
+
+/// Customer Receipt - the AR mirror of VendorPayment, per BRD 5.7/5.9
+/// "customer receipts" / "customer advance". Invoice mode settles one or
+/// more posted sales invoices; Advance mode records a prepayment ahead of
+/// any invoice (Dr Bank-Cash / Cr Customer Advance, a liability until
+/// earned).
+model CustomerReceipt {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  customerId      String   @map("customer_id")
+  receiptNo       String   @map("receipt_no")
+  receiptDate     DateTime @default(now()) @map("receipt_date")
+  amount          Decimal  @db.Decimal(18, 3)
+  paymentMethodId String   @map("payment_method_id")
+  bankAccountId   String?  @map("bank_account_id")
+  mode            String   @default("Invoice") @map("mode") // Invoice|Advance
+  postingStatus   String   @default("Draft") @map("posting_status")
+  // Cheque register fields, mirroring VendorPayment - only meaningful when
+  // paymentMethod.type is "Cheque".
+  chequeNo        String?  @map("cheque_no")
+  chequeDate      DateTime? @map("cheque_date")
+  chequeStatus    String?  @map("cheque_status") // Issued|Cleared|Bounced|Cancelled
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id])
+  customer        Customer      @relation(fields: [customerId], references: [id])
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+  bankAccount     BankAccount?  @relation(fields: [bankAccountId], references: [id])
+
+  invoices        CustomerReceiptInvoice[]
+
+  @@unique([tenantId, receiptNo])
+  @@index([tenantId])
+  @@map("customer_receipts")
+}
+
+/// Allocation of a (possibly multi-invoice) customer receipt across invoices.
+model CustomerReceiptInvoice {
+  id              String  @id @default(uuid())
+  tenantId        String  @map("tenant_id")
+  receiptId       String  @map("receipt_id")
+  salesInvoiceId  String  @map("sales_invoice_id")
+  appliedAmount   Decimal @db.Decimal(18, 3) @map("applied_amount")
+
+  tenant          Tenant       @relation(fields: [tenantId], references: [id])
+  receipt         CustomerReceipt @relation(fields: [receiptId], references: [id])
+  salesInvoice    SalesInvoice @relation(fields: [salesInvoiceId], references: [id])
+
+  @@index([tenantId])
+  @@map("customer_receipt_invoices")
+}
+
+/// Contra Voucher - a transfer between two of the company's own bank/cash
+/// accounts (e.g. cash deposited into the bank), per BRD 5.9 "banking,
+/// contra, cheque register". Posts Dr toBankAccount / Cr fromBankAccount at
+/// each account's own GL, net zero impact on the business overall.
+model ContraVoucher {
+  id               String   @id @default(uuid())
+  tenantId         String   @map("tenant_id")
+  companyId        String   @map("company_id")
+  voucherNo        String   @map("voucher_no")
+  voucherDate      DateTime @default(now()) @map("voucher_date")
+  fromBankAccountId String  @map("from_bank_account_id")
+  toBankAccountId  String   @map("to_bank_account_id")
+  amount           Decimal  @db.Decimal(18, 3)
+  narration        String?
+  status           String   @default("Draft") // Draft|Posted|Cancelled
+
+  tenant           Tenant      @relation(fields: [tenantId], references: [id])
+  company          Company     @relation(fields: [companyId], references: [id])
+  fromBankAccount  BankAccount @relation("ContraFromBankAccount", fields: [fromBankAccountId], references: [id])
+  toBankAccount    BankAccount @relation("ContraToBankAccount", fields: [toBankAccountId], references: [id])
+
+  @@unique([tenantId, voucherNo])
+  @@index([tenantId])
+  @@map("contra_vouchers")
+}
+
+// ============================================================================
+// 7. RECIPE MANAGEMENT
+// ============================================================================
+
+model Recipe {
+  id               String   @id @default(uuid())
+  tenantId         String   @map("tenant_id")
+  outputItemId     String   @map("output_item_id")
+  recipeType       String   @map("recipe_type") // Menu|Semi-finished|Production BOM|Modifier|Packaging|Combo|Staff Meal|Catering
+  defaultOutputQty Decimal  @default(1) @db.Decimal(18, 3) @map("default_output_qty")
+  status           String   @default("Draft")
+
+  tenant           Tenant   @relation(fields: [tenantId], references: [id])
+  outputItem       Item     @relation(fields: [outputItemId], references: [id])
+
+  versions         RecipeVersion[]
+  posItemMappings  PosItemMapping[]
+
+  @@index([tenantId])
+  @@map("recipes")
+}
+
+model RecipeVersion {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  recipeId      String   @map("recipe_id")
+  versionNo     Int      @map("version_no")
+  effectiveFrom DateTime @default(now()) @map("effective_from")
+  approvedBy    String?  @map("approved_by")
+  status        String   @default("Draft") // Draft|Approved|Superseded
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  recipe        Recipe   @relation(fields: [recipeId], references: [id])
+
+  ingredients        RecipeIngredient[]
+  costSnapshots      RecipeCostSnapshot[]
+  salesInvoiceLines  SalesInvoiceLine[]
+  productionPostings ProductionPosting[]
+  usedAsModifierIn   SalesInvoiceLineModifier[]
+
+  @@unique([tenantId, recipeId, versionNo])
+  @@index([tenantId])
+  @@map("recipe_versions")
+}
+
+model RecipeIngredient {
+  id               String   @id @default(uuid())
+  tenantId         String   @map("tenant_id")
+  recipeVersionId  String   @map("recipe_version_id")
+  ingredientItemId String   @map("ingredient_item_id")
+  qty              Decimal  @db.Decimal(18, 6)
+  uomId            String   @map("uom_id")
+  wastagePct       Decimal  @default(0) @db.Decimal(5, 2) @map("wastage_pct")
+  isPackaging      Boolean  @default(false) @map("is_packaging")
+
+  tenant           Tenant        @relation(fields: [tenantId], references: [id])
+  recipeVersion    RecipeVersion @relation(fields: [recipeVersionId], references: [id])
+  ingredientItem   Item          @relation(fields: [ingredientItemId], references: [id])
+  uom              Uom           @relation(fields: [uomId], references: [id])
+
+  @@index([tenantId, recipeVersionId])
+  @@map("recipe_ingredients")
+}
+
+/// One snapshot per branch/warehouse, per BRD 5.6 "costing snapshot ...
+/// branch applicability" - the same recipe can cost differently at
+/// different branches depending on local ingredient prices, so this is not
+/// a single value per version. Refreshable any time via
+/// POST /recipe-versions/:id/recompute-cost, independent of re-approving.
+model RecipeCostSnapshot {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  recipeVersionId String   @map("recipe_version_id")
+  warehouseId     String?  @map("warehouse_id")
+  branchId        String?  @map("branch_id")
+  costDate        DateTime @default(now()) @map("cost_date")
+  totalCost       Decimal  @db.Decimal(18, 6) @map("total_cost")
+  marginPct       Decimal? @db.Decimal(5, 2) @map("margin_pct")
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id])
+  recipeVersion   RecipeVersion @relation(fields: [recipeVersionId], references: [id])
+  warehouse       Warehouse?    @relation(fields: [warehouseId], references: [id])
+  branch          Branch?       @relation(fields: [branchId], references: [id])
+
+  @@index([tenantId, recipeVersionId])
+  @@map("recipe_cost_snapshots")
+}
+
+/// Executes a Production BOM / Semi-finished recipe: consumes its
+/// ingredients from a warehouse and produces the recipe's output item into
+/// that same warehouse's stock, at the cost the ingredients actually cost -
+/// this is what makes "Semi-finished" and "Production BOM" recipe types
+/// operational rather than just labels (BRD 5.6).
+model ProductionPosting {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  postingNo       String   @map("posting_no")
+  recipeVersionId String   @map("recipe_version_id")
+  warehouseId     String   @map("warehouse_id")
+  branchId        String?  @map("branch_id")
+  outputQty       Decimal  @db.Decimal(18, 3) @map("output_qty")
+  postingDate     DateTime @default(now()) @map("posting_date")
+  status          String   @default("Draft") // Draft|Posted|Cancelled
+  totalCost       Decimal  @default(0) @db.Decimal(18, 6) @map("total_cost")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id])
+  recipeVersion   RecipeVersion @relation(fields: [recipeVersionId], references: [id])
+  warehouse       Warehouse     @relation(fields: [warehouseId], references: [id])
+  branch          Branch?       @relation(fields: [branchId], references: [id])
+
+  lines           ProductionPostingLine[]
+
+  @@unique([tenantId, postingNo])
+  @@index([tenantId])
+  @@map("production_postings")
+}
+
+model ProductionPostingLine {
+  id               String  @id @default(uuid())
+  tenantId         String  @map("tenant_id")
+  postingId        String  @map("posting_id")
+  ingredientItemId String  @map("ingredient_item_id")
+  qty              Decimal @db.Decimal(18, 6)
+  unitCost         Decimal @default(0) @db.Decimal(18, 6) @map("unit_cost")
+  totalCost        Decimal @default(0) @db.Decimal(18, 6) @map("total_cost")
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id])
+  posting          ProductionPosting @relation(fields: [postingId], references: [id])
+  ingredientItem   Item              @relation(fields: [ingredientItemId], references: [id])
+
+  @@index([tenantId, postingId])
+  @@map("production_posting_lines")
+}
+
+// ============================================================================
+// 8. SALES / POS
+// ============================================================================
+
+model Customer {
+  id                     String   @id @default(uuid())
+  tenantId               String   @map("tenant_id")
+  code                   String
+  name                   String
+  customerType           String   @default("Walk-in") @map("customer_type") // Walk-in|Corporate|Aggregator|Staff
+  contactPerson          String?  @map("contact_person")
+  phone                  String?
+  whatsapp               String?
+  email                  String?
+  address                String?
+  countryId              String?  @map("country_id")
+  cityId                 String?  @map("city_id")
+  areaId                 String?  @map("area_id")
+  taxRegistrationNumber  String?  @map("tax_registration_number")
+  paymentTermsId         String?  @map("payment_terms_id")
+  dateOfBirth            DateTime? @map("date_of_birth")
+  receivableGlId         String?  @map("receivable_gl_id")
+  creditLimit            Decimal? @db.Decimal(18, 3) @map("credit_limit")
+  notes                  String?
+  status                 String   @default("Active")
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  country        Country? @relation(fields: [countryId], references: [id])
+  city           City?    @relation(fields: [cityId], references: [id])
+  area           Area?    @relation(fields: [areaId], references: [id])
+  paymentTerms   Term?    @relation(fields: [paymentTermsId], references: [id])
+  salesInvoices  SalesInvoice[]
+  salesQuotes    SalesQuote[]
+  deliveryOrders DeliveryOrder[]
+  salesReturns   SalesReturn[]
+  creditNotes    CustomerCreditNote[]
+  receipts       CustomerReceipt[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("customers")
+}
+
+model SalesChannel {
+  id               String  @id @default(uuid())
+  tenantId         String  @map("tenant_id")
+  code             String
+  name             String
+  defaultCustomerId String? @map("default_customer_id")
+  revenueGlId      String? @map("revenue_gl_id")
+  status           String  @default("Active")
+
+  tenant           Tenant  @relation(fields: [tenantId], references: [id])
+  salesInvoices    SalesInvoice[]
+  itemPrices       ItemPrice[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("sales_channels")
+}
+
+model PosConnector {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  branchId          String   @map("branch_id")
+  provider          String   // Manual Excel|API Ready|Foodics|Oracle MICROS|LS Retail|Square|Custom POS
+  connectionType    String   @default("File") @map("connection_type") // File|API|Manual
+  externalStoreCode String?  @map("external_store_code")
+  status            String   @default("Active")
+  lastSyncStatus    String?  @map("last_sync_status")
+  lastSyncAt        DateTime? @map("last_sync_at")
+
+  tenant            Tenant   @relation(fields: [tenantId], references: [id])
+  branch            Branch   @relation(fields: [branchId], references: [id])
+
+  importBatches     SalesImportBatch[]
+
+  @@index([tenantId, branchId])
+  @@map("pos_connectors")
+}
+
+model PosItemMapping {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  branchId     String   @map("branch_id")
+  posItemCode  String   @map("pos_item_code")
+  itemId       String   @map("item_id")
+  recipeId     String?  @map("recipe_id")
+  taxId        String?  @map("tax_id")
+  activeFrom   DateTime @default(now()) @map("active_from")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  branch       Branch   @relation(fields: [branchId], references: [id])
+  item         Item     @relation(fields: [itemId], references: [id])
+  recipe       Recipe?  @relation(fields: [recipeId], references: [id])
+  tax          Tax?     @relation(fields: [taxId], references: [id])
+
+  @@unique([tenantId, branchId, posItemCode, activeFrom])
+  @@index([tenantId])
+  @@map("pos_item_mappings")
+}
+
+model SalesImportBatch {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  connectorId  String?  @map("connector_id")
+  branchId     String   @map("branch_id")
+  businessDate DateTime @map("business_date")
+  importedBy   String?  @map("imported_by")
+  status       String   @default("Imported") // Imported|Validated|Exception|Posted|Cancelled
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id])
+  connector    PosConnector? @relation(fields: [connectorId], references: [id])
+  branch       Branch        @relation(fields: [branchId], references: [id])
+
+  invoices     SalesInvoice[]
+
+  @@index([tenantId, branchId, businessDate])
+  @@map("sales_import_batches")
+}
+
+model SalesInvoice {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  branchId       String   @map("branch_id")
+  customerId     String?  @map("customer_id")
+  salesChannelId String?  @map("sales_channel_id")
+  importBatchId  String?  @map("import_batch_id")
+  sourceQuoteId  String?  @map("source_quote_id")
+  // POS = created via /sales-import (retail, paid at point of sale).
+  // Wholesale = created directly for a B2B/credit customer, usually from a
+  // SalesQuote, fulfilled by a DeliveryOrder before being posted.
+  salesType      String   @default("POS") @map("sales_type") // POS|Wholesale
+  dueDate        DateTime? @map("due_date") // set from the customer's payment terms on Wholesale invoices
+  businessDate   DateTime @map("business_date")
+  invoiceNo      String   @map("invoice_no")
+  gross          Decimal  @default(0) @db.Decimal(18, 3)
+  discount       Decimal  @default(0) @db.Decimal(18, 3)
+  tax            Decimal  @default(0) @db.Decimal(18, 3)
+  net            Decimal  @default(0) @db.Decimal(18, 3)
+  postingStatus  String   @default("Draft") @map("posting_status")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  tenant         Tenant        @relation(fields: [tenantId], references: [id])
+  branch         Branch        @relation(fields: [branchId], references: [id])
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  salesChannel   SalesChannel? @relation(fields: [salesChannelId], references: [id])
+  importBatch    SalesImportBatch? @relation(fields: [importBatchId], references: [id])
+  sourceQuote    SalesQuote?   @relation(fields: [sourceQuoteId], references: [id])
+
+  lines          SalesInvoiceLine[]
+  payments       SalesPayment[]
+  deliveryOrders DeliveryOrder[]
+  salesReturns   SalesReturn[]
+  creditNotes    CustomerCreditNote[]
+  receiptInvoices CustomerReceiptInvoice[]
+
+  @@unique([tenantId, branchId, invoiceNo, businessDate])
+  @@index([tenantId])
+  @@map("sales_invoices")
+}
+
+model SalesInvoiceLine {
+  id              String   @id @default(uuid())
+  tenantId        String   @map("tenant_id")
+  salesInvoiceId  String   @map("sales_invoice_id")
+  itemId          String?  @map("item_id")
+  posItemCode     String?  @map("pos_item_code")
+  qty             Decimal  @db.Decimal(18, 3)
+  unitPrice       Decimal  @db.Decimal(18, 3) @map("unit_price")
+  taxId           String?  @map("tax_id")
+  recipeVersionId String?  @map("recipe_version_id")
+
+  tenant          Tenant        @relation(fields: [tenantId], references: [id])
+  salesInvoice    SalesInvoice  @relation(fields: [salesInvoiceId], references: [id])
+  item            Item?         @relation(fields: [itemId], references: [id])
+  tax             Tax?          @relation(fields: [taxId], references: [id])
+  recipeVersion   RecipeVersion? @relation(fields: [recipeVersionId], references: [id])
+
+  consumptionLines ConsumptionLine[]
+  modifiers        SalesInvoiceLineModifier[]
+
+  @@index([tenantId, salesInvoiceId])
+  @@map("sales_invoice_lines")
+}
+
+/// Attaches zero or more Modifier-type recipes to a sold line (e.g. "extra
+/// cheese", "no onions"), per BRD 5.6 "modifiers basic". A modifier's own
+/// recipe ingredients are exploded on top of the base item's at consumption
+/// time - positive qty ingredients add stock consumption, negative qty
+/// ingredients (e.g. "no onions") reduce it.
+model SalesInvoiceLineModifier {
+  id                    String  @id @default(uuid())
+  tenantId              String  @map("tenant_id")
+  salesInvoiceLineId    String  @map("sales_invoice_line_id")
+  modifierRecipeVersionId String @map("modifier_recipe_version_id")
+  qty                   Decimal @default(1) @db.Decimal(18, 3)
+
+  tenant                Tenant           @relation(fields: [tenantId], references: [id])
+  salesInvoiceLine      SalesInvoiceLine @relation(fields: [salesInvoiceLineId], references: [id])
+  modifierRecipeVersion RecipeVersion    @relation(fields: [modifierRecipeVersionId], references: [id])
+
+  @@index([tenantId, salesInvoiceLineId])
+  @@map("sales_invoice_line_modifiers")
+}
+
+model SalesPayment {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  salesInvoiceId    String   @map("sales_invoice_id")
+  paymentMethodId   String   @map("payment_method_id")
+  amount            Decimal  @db.Decimal(18, 3)
+  clearingAccountId String?  @map("clearing_account_id")
+  referenceNo       String?  @map("reference_no")
+
+  tenant            Tenant       @relation(fields: [tenantId], references: [id])
+  salesInvoice      SalesInvoice @relation(fields: [salesInvoiceId], references: [id])
+  paymentMethod     PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+
+  @@index([tenantId, salesInvoiceId])
+  @@map("sales_payments")
+}
+
+/// Not detailed at screen-spec level in the original blueprint (the BRD only
+/// lists it as a bullet: "sales orders, quotations, delivery notes, sales
+/// invoices ..."), built out at the user's request for the wholesale/B2B
+/// flow: Quote -> (converted to) a draft Wholesale SalesInvoice -> a
+/// DeliveryOrder ships the goods -> the invoice is posted -> a SalesReturn
+/// can later reverse part of it with a credit note.
+model SalesQuote {
+  id         String   @id @default(uuid())
+  tenantId   String   @map("tenant_id")
+  quoteNo    String   @map("quote_no")
+  customerId String   @map("customer_id")
+  branchId   String   @map("branch_id")
+  quoteDate  DateTime @default(now()) @map("quote_date")
+  validUntil DateTime? @map("valid_until")
+  status     String   @default("Draft") // Draft|Sent|Accepted|Rejected|Expired|Converted
+  notes      String?
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+  customer   Customer @relation(fields: [customerId], references: [id])
+  branch     Branch   @relation(fields: [branchId], references: [id])
+
+  lines      SalesQuoteLine[]
+  invoices   SalesInvoice[]
+
+  @@unique([tenantId, quoteNo])
+  @@index([tenantId])
+  @@map("sales_quotes")
+}
+
+model SalesQuoteLine {
+  id        String  @id @default(uuid())
+  tenantId  String  @map("tenant_id")
+  quoteId   String  @map("quote_id")
+  itemId    String  @map("item_id")
+  qty       Decimal @db.Decimal(18, 3)
+  uomId     String? @map("uom_id")
+  unitPrice Decimal @db.Decimal(18, 3) @map("unit_price")
+  taxId     String? @map("tax_id")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  quote     SalesQuote @relation(fields: [quoteId], references: [id])
+  item      Item       @relation(fields: [itemId], references: [id])
+  uom       Uom?       @relation(fields: [uomId], references: [id])
+  tax       Tax?       @relation(fields: [taxId], references: [id])
+
+  @@index([tenantId, quoteId])
+  @@map("sales_quote_lines")
+}
+
+/// Delivery Order (DO) - ships goods to the customer ahead of/at invoicing.
+/// Posting reduces stock (qtyOut, weighted-average cost) and books
+/// Dr COGS / Cr Inventory Asset, the sales-side mirror of a GRN.
+model DeliveryOrder {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  doNo           String   @map("do_no")
+  salesInvoiceId String?  @map("sales_invoice_id")
+  customerId     String   @map("customer_id")
+  branchId       String   @map("branch_id")
+  warehouseId    String   @map("warehouse_id")
+  doDate         DateTime @default(now()) @map("do_date")
+  status         String   @default("Draft") // Draft|Delivered|Cancelled
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant        @relation(fields: [tenantId], references: [id])
+  salesInvoice   SalesInvoice? @relation(fields: [salesInvoiceId], references: [id])
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  branch         Branch        @relation(fields: [branchId], references: [id])
+  warehouse      Warehouse     @relation(fields: [warehouseId], references: [id])
+
+  lines          DeliveryOrderLine[]
+  salesReturns   SalesReturn[]
+
+  @@unique([tenantId, doNo])
+  @@index([tenantId])
+  @@map("delivery_orders")
+}
+
+model DeliveryOrderLine {
+  id        String  @id @default(uuid())
+  tenantId  String  @map("tenant_id")
+  doId      String  @map("do_id")
+  itemId    String  @map("item_id")
+  batchNo   String? @map("batch_no")
+  qty       Decimal @db.Decimal(18, 3)
+  unitCost  Decimal @default(0) @db.Decimal(18, 6) @map("unit_cost") // captured at delivery from the item's average cost
+
+  tenant         Tenant        @relation(fields: [tenantId], references: [id])
+  deliveryOrder  DeliveryOrder @relation(fields: [doId], references: [id])
+  item           Item          @relation(fields: [itemId], references: [id])
+
+  salesReturnLines SalesReturnLine[]
+
+  @@index([tenantId, doId])
+  @@map("delivery_order_lines")
+}
+
+/// Sales Return - customer sends goods back. Posting restocks (qtyIn at the
+/// line's captured unit cost, so margin already booked doesn't drift) and,
+/// if the source invoice was already posted, raises a customer credit note
+/// reducing what they owe (the sales-side mirror of a vendor Goods Return).
+model SalesReturn {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  returnNo       String   @map("return_no")
+  salesInvoiceId String?  @map("sales_invoice_id")
+  doId           String?  @map("do_id")
+  customerId     String   @map("customer_id")
+  branchId       String   @map("branch_id")
+  warehouseId    String   @map("warehouse_id")
+  returnDate     DateTime @default(now()) @map("return_date")
+  reason         String?
+  status         String   @default("Draft") // Draft|Posted|Cancelled
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id])
+  salesInvoice   SalesInvoice?  @relation(fields: [salesInvoiceId], references: [id])
+  deliveryOrder  DeliveryOrder? @relation(fields: [doId], references: [id])
+  customer       Customer       @relation(fields: [customerId], references: [id])
+  branch         Branch         @relation(fields: [branchId], references: [id])
+  warehouse      Warehouse      @relation(fields: [warehouseId], references: [id])
+
+  lines          SalesReturnLine[]
+  creditNotes    CustomerCreditNote[]
+
+  @@unique([tenantId, returnNo])
+  @@index([tenantId])
+  @@map("sales_returns")
+}
+
+model SalesReturnLine {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  returnId    String   @map("return_id")
+  doLineId    String?  @map("do_line_id")
+  itemId      String   @map("item_id")
+  batchNo     String?  @map("batch_no")
+  returnQty   Decimal  @db.Decimal(18, 3) @map("return_qty")
+  unitCost    Decimal  @default(0) @db.Decimal(18, 6) @map("unit_cost") // cost basis, used to value the stock coming back in
+  unitPrice   Decimal? @db.Decimal(18, 3) @map("unit_price") // original selling price, used to size the credit note - looked up from the source invoice line if not supplied
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id])
+  salesReturn SalesReturn       @relation(fields: [returnId], references: [id])
+  doLine      DeliveryOrderLine? @relation(fields: [doLineId], references: [id])
+  item        Item              @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId, returnId])
+  @@map("sales_return_lines")
+}
+
+/// Credit note against a customer - issued when returned goods had already
+/// been invoiced, reducing what the customer owes (mirrors VendorDebitNote).
+model CustomerCreditNote {
+  id                String   @id @default(uuid())
+  tenantId          String   @map("tenant_id")
+  creditNoteNo      String   @map("credit_note_no")
+  customerId        String   @map("customer_id")
+  salesReturnId     String?  @map("sales_return_id")
+  salesInvoiceId    String?  @map("sales_invoice_id")
+  amount            Decimal  @db.Decimal(18, 3)
+  postingStatus     String   @default("Draft") @map("posting_status") // Draft|Posted|Cancelled
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant       @relation(fields: [tenantId], references: [id])
+  customer          Customer     @relation(fields: [customerId], references: [id])
+  salesReturn       SalesReturn? @relation(fields: [salesReturnId], references: [id])
+  salesInvoice      SalesInvoice? @relation(fields: [salesInvoiceId], references: [id])
+
+  @@unique([tenantId, creditNoteNo])
+  @@index([tenantId])
+  @@map("customer_credit_notes")
+}
+
+// ============================================================================
+// 9. RECIPE CONSUMPTION FROM SALES
+// ============================================================================
+
+model ConsumptionPosting {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  branchId     String   @map("branch_id")
+  businessDate DateTime @map("business_date")
+  postingDate  DateTime @default(now()) @map("posting_date")
+  status       String   @default("Draft") // Draft|Exception|Posted|Cancelled
+  journalId    String?  @map("journal_id")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  branch       Branch   @relation(fields: [branchId], references: [id])
+  journal      JournalEntry? @relation(fields: [journalId], references: [id])
+
+  lines        ConsumptionLine[]
+  exceptions   ConsumptionException[]
+
+  @@unique([tenantId, branchId, businessDate])
+  @@index([tenantId])
+  @@map("consumption_postings")
+}
+
+model ConsumptionLine {
+  id               String  @id @default(uuid())
+  tenantId         String  @map("tenant_id")
+  postingId        String  @map("posting_id")
+  salesLineId      String? @map("sales_line_id")
+  ingredientItemId String  @map("ingredient_item_id")
+  warehouseId      String  @map("warehouse_id")
+  qty              Decimal @db.Decimal(18, 3)
+  unitCost         Decimal @db.Decimal(18, 6) @map("unit_cost")
+  totalCost        Decimal @db.Decimal(18, 3) @map("total_cost")
+
+  tenant           Tenant             @relation(fields: [tenantId], references: [id])
+  posting          ConsumptionPosting @relation(fields: [postingId], references: [id])
+  salesLine        SalesInvoiceLine?  @relation(fields: [salesLineId], references: [id])
+  ingredientItem   Item               @relation(fields: [ingredientItemId], references: [id])
+  warehouse        Warehouse          @relation(fields: [warehouseId], references: [id])
+
+  @@index([tenantId, postingId])
+  @@map("consumption_lines")
+}
+
+model ConsumptionException {
+  id            String  @id @default(uuid())
+  tenantId      String  @map("tenant_id")
+  postingId     String? @map("posting_id")
+  salesLineId   String? @map("sales_line_id")
+  exceptionType String  @map("exception_type") // Missing Recipe|Missing UOM Conversion|Missing Cost|Missing Warehouse|Negative Stock|Missing GL
+  message       String
+  status        String  @default("Open") // Open|Resolved|Ignored
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant        Tenant              @relation(fields: [tenantId], references: [id])
+  posting       ConsumptionPosting? @relation(fields: [postingId], references: [id])
+
+  @@index([tenantId, postingId])
+  @@map("consumption_exceptions")
+}
+
+// ============================================================================
+// 10. FINANCE
+// ============================================================================
+
+/// Financial-statement classification for accounts, e.g. "Current Assets",
+/// "Direct Income" - distinct from ChartOfAccount's own parent/child tree
+/// (which nests individual accounts under each other). A group's natureType
+/// determines which statement it rolls into: Asset/Liability/Equity ->
+/// Balance Sheet, Revenue/Expense -> Profit and Loss. sortOrder controls
+/// presentation order within that statement.
+model AccountGroup {
+  id            String  @id @default(uuid())
+  tenantId      String  @map("tenant_id")
+  code          String
+  name          String
+  natureType    String  @map("nature_type") // Asset|Liability|Equity|Revenue|Expense
+  parentGroupId String? @map("parent_group_id")
+  sortOrder     Int     @default(0) @map("sort_order")
+  status        String  @default("Active")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id])
+  parentGroup   AccountGroup?  @relation("AccountGroupParent", fields: [parentGroupId], references: [id])
+  childGroups   AccountGroup[] @relation("AccountGroupParent")
+
+  accounts      ChartOfAccount[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("account_groups")
+}
+
+model ChartOfAccount {
+  id               String  @id @default(uuid())
+  tenantId         String  @map("tenant_id")
+  companyId        String  @map("company_id")
+  code             String
+  name             String
+  accountType      String  @map("account_type") // Asset|Liability|Equity|Revenue|Expense
+  groupId          String? @map("group_id")
+  parentId         String? @map("parent_id")
+  isControlAccount Boolean @default(false) @map("is_control_account")
+  status           String  @default("Active")
+
+  tenant           Tenant  @relation(fields: [tenantId], references: [id])
+  company          Company @relation(fields: [companyId], references: [id])
+  group            AccountGroup? @relation(fields: [groupId], references: [id])
+  parent           ChartOfAccount? @relation("CoaParent", fields: [parentId], references: [id])
+  children         ChartOfAccount[] @relation("CoaParent")
+
+  bankAccounts     BankAccount[]
+  journalLines     JournalLine[]
+
+  @@unique([tenantId, companyId, code])
+  @@index([tenantId])
+  @@map("chart_of_accounts")
+}
+
+model BankAccount {
+  id               String  @id @default(uuid())
+  tenantId         String  @map("tenant_id")
+  companyId        String  @map("company_id")
+  accountId        String  @map("account_id") // FK to chart_of_accounts
+  bankId           String? @map("bank_id") // optional link into the Bank reference master
+  bankName         String  @map("bank_name") // kept even when bankId is set, for display/back-compat
+  accountNoMasked  String? @map("account_no_masked")
+  status           String  @default("Active")
+
+  tenant           Tenant         @relation(fields: [tenantId], references: [id])
+  company          Company        @relation(fields: [companyId], references: [id])
+  account          ChartOfAccount @relation(fields: [accountId], references: [id])
+  bank             Bank?          @relation(fields: [bankId], references: [id])
+
+  vendorPayments   VendorPayment[]
+  customerReceipts CustomerReceipt[]
+  contraVouchersFrom ContraVoucher[] @relation("ContraFromBankAccount")
+  contraVouchersTo   ContraVoucher[] @relation("ContraToBankAccount")
+  statementLines     BankStatementLine[]
+
+  @@index([tenantId, companyId])
+  @@map("bank_accounts")
+}
+
+/// One line of an imported/entered bank statement, per BRD 5.9 "banking,
+/// contra, cheque register" - reconciliation source data. MVP scope is
+/// manual entry (no live bank feed); each line gets matched against a
+/// posted VendorPayment/CustomerReceipt/ContraVoucher that hit the same
+/// bank account, or left unmatched to surface as a reconciling item.
+model BankStatementLine {
+  id                 String   @id @default(uuid())
+  tenantId           String   @map("tenant_id")
+  bankAccountId      String   @map("bank_account_id")
+  lineDate           DateTime @map("line_date")
+  description        String?
+  // Positive = money in (deposit/credit at the bank), negative = money out
+  // (withdrawal/cheque cleared).
+  amount             Decimal  @db.Decimal(18, 3)
+  reconciled         Boolean  @default(false)
+  matchedVoucherType String?  @map("matched_voucher_type") // VendorPayment|CustomerReceipt|ContraVoucher
+  matchedVoucherId   String?  @map("matched_voucher_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  tenant             Tenant      @relation(fields: [tenantId], references: [id])
+  bankAccount        BankAccount @relation(fields: [bankAccountId], references: [id])
+
+  @@index([tenantId, bankAccountId])
+  @@map("bank_statement_lines")
+}
+
+/// Append-only GL journal header. Corrections use reversal journals.
+model JournalEntry {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  companyId     String   @map("company_id")
+  journalDate   DateTime @default(now()) @map("journal_date")
+  sourceModule  String   @map("source_module") // Procurement|Sales|Consumption|Payroll|Assets|Manual
+  sourceDocId   String?  @map("source_doc_id")
+  status        String   @default("Draft") // Draft|Submitted|Approved|Posted|Cancelled
+  postedBy      String?  @map("posted_by")
+  postedAt      DateTime? @map("posted_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  company       Company  @relation(fields: [companyId], references: [id])
+
+  lines               JournalLine[]
+  consumptionPostings  ConsumptionPosting[]
+
+  @@index([tenantId, companyId, journalDate])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id             String  @id @default(uuid())
+  tenantId       String  @map("tenant_id")
+  journalId      String  @map("journal_id")
+  accountId      String  @map("account_id")
+  debit          Decimal @default(0) @db.Decimal(18, 3)
+  credit         Decimal @default(0) @db.Decimal(18, 3)
+  branchId       String? @map("branch_id")
+  costCentreId   String? @map("cost_centre_id")
+  profitCentreId String? @map("profit_centre_id")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id])
+  journal        JournalEntry   @relation(fields: [journalId], references: [id])
+  account        ChartOfAccount @relation(fields: [accountId], references: [id])
+  costCentre     CostCentre?    @relation(fields: [costCentreId], references: [id])
+  profitCentre   ProfitCentre?  @relation(fields: [profitCentreId], references: [id])
+
+  @@index([tenantId, journalId])
+  @@index([accountId, journalId])
+  @@map("journal_lines")
+}
+
+model PostingRule {
+  id           String @id @default(uuid())
+  tenantId     String @map("tenant_id")
+  sourceModule String @map("source_module")
+  eventCode    String @map("event_code") // e.g. GRN_POSTED, SALES_INVOICE_POSTED, CONSUMPTION_POSTED
+  debitRule    String @map("debit_rule")  // JSON/text rule describing debit account resolution
+  creditRule   String @map("credit_rule")
+  status       String @default("Active")
+
+  tenant       Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, sourceModule, eventCode])
+  @@index([tenantId])
+  @@map("posting_rules")
+}
+
+model PostingException {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  sourceModule  String   @map("source_module")
+  sourceDocId   String?  @map("source_doc_id")
+  exceptionType String   @map("exception_type") // Missing GL|Closed Period|Unbalanced Journal|Missing Cost|Missing UOM
+  message       String
+  status        String   @default("Open") // Open|Resolved|Ignored
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, sourceModule, sourceDocId])
+  @@map("posting_exceptions")
+}
+
+// ============================================================================
+// 11. WORKFLOW / DOCUMENTS / NOTIFICATIONS
+// ============================================================================
+
+model DocumentType {
+  id                  String  @id @default(uuid())
+  tenantId            String  @map("tenant_id")
+  moduleCode          String  @map("module_code")
+  name                String
+  expiryRequired      Boolean @default(false) @map("expiry_required")
+  verificationRequired Boolean @default(false) @map("verification_required")
+  mandatory           Boolean @default(false)
+
+  tenant              Tenant  @relation(fields: [tenantId], references: [id])
+  attachments         DocumentAttachment[]
+  vendorDocuments     VendorDocument[]
+
+  @@unique([tenantId, moduleCode, name])
+  @@index([tenantId])
+  @@map("document_types")
+}
+
+/// Polymorphic attachment: module_code + record_id identifies the parent
+/// record. Enforced in the service layer (no DB-level FK to the target).
+model DocumentAttachment {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  moduleCode     String    @map("module_code")
+  recordId       String    @map("record_id")
+  documentTypeId String    @map("document_type_id")
+  fileRef        String    @map("file_ref")
+  issueDate      DateTime? @map("issue_date")
+  expiryDate     DateTime? @map("expiry_date")
+  status         String    @default("Active")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  tenant         Tenant       @relation(fields: [tenantId], references: [id])
+  documentType   DocumentType @relation(fields: [documentTypeId], references: [id])
+
+  @@index([tenantId, moduleCode, recordId])
+  @@index([tenantId, documentTypeId, expiryDate, status])
+  @@map("document_attachments")
+}
+
+/// moduleCode matches the permission-key module namespace of the document
+/// being approved (e.g. "Procurement.MaterialRequest", "Inventory.StockTransfer") -
+/// that's what src/services/approvalService.ts looks up on submit.
+/// approvalLevelsJson shape: [{ "level": 1, "approverRoleCode": "StoreKeeper" }, { "level": 2, "approverRoleCode": "FinanceManager" }, ...]
+/// Levels run in ascending order; every Active user holding that level's role
+/// gets a task (first one to act decides the level - see approvalService.ts).
+/// conditionJson (amount/branch/role/variance rules) is parsed but not yet
+/// evaluated - every workflow row currently applies unconditionally to every
+/// document of its moduleCode.
+model ApprovalWorkflow {
+  id                 String @id @default(uuid())
+  tenantId           String @map("tenant_id")
+  moduleCode         String @map("module_code")
+  conditionJson      Json   @default("{}") @map("condition_json") // amount/branch/role/variance rules
+  approvalLevelsJson Json   @default("[]") @map("approval_levels_json")
+  status             String @default("Active")
+
+  tenant             Tenant @relation(fields: [tenantId], references: [id])
+  tasks              ApprovalTask[]
+
+  @@index([tenantId, moduleCode])
+  @@map("approval_workflows")
+}
+
+model ApprovalTask {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  workflowId     String    @map("workflow_id")
+  recordId       String    @map("record_id")
+  level          Int       @default(1)
+  approverUserId String    @map("approver_user_id")
+  status         String    @default("Pending") // Pending|Approved|Rejected|Skipped
+  actedAt        DateTime? @map("acted_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  tenant         Tenant           @relation(fields: [tenantId], references: [id])
+  workflow       ApprovalWorkflow @relation(fields: [workflowId], references: [id])
+  approver       User             @relation(fields: [approverUserId], references: [id])
+
+  @@index([tenantId, approverUserId, status, createdAt])
+  @@map("approval_tasks")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  userId    String   @map("user_id")
+  channel   String   @default("InApp") // InApp|Email|SMS|WhatsApp
+  title     String
+  body      String
+  status    String   @default("Unread") // Unread|Read|Dismissed
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id])
+  user      User   @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, userId, status])
+  @@map("notifications")
+}

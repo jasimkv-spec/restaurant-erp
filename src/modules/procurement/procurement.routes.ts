@@ -1,0 +1,1618 @@
+import { Router } from "express";
+import { z } from "zod";
+import { prisma } from "../../lib/prisma";
+import { crudRouter } from "../../utils/crudFactory";
+import { asyncHandler } from "../../utils/asyncHandler";
+import { requirePermission } from "../../middleware/rbac";
+import { ApiError } from "../../utils/errors";
+import { nextDocumentNumber } from "../../utils/documentNumber";
+import { postStockMovement } from "../../services/stockService";
+import { postJournal, recordPostingException } from "../../services/journalService";
+import { resolveCoaByCode } from "../../services/coaLookup";
+import { triggerApproval } from "../../services/approvalService";
+import { writeAuditLog } from "../../services/auditService";
+
+const router = Router();
+
+// PO/GRN/Invoice quantity & amount tolerance, per BRD 5.4 & 10.1
+// ("PO, GRN, and purchase invoice must support quantity and amount
+// tolerance controls"). Kept as a simple constant for MVP; promote to a
+// company policy setting in a later phase.
+const TOLERANCE_PCT = 0.02;
+
+// --- Vendors --------------------------------------------------------------
+router.use(
+  "/vendors",
+  crudRouter(prisma.vendor, {
+    permissionKey: "Procurement.Vendor",
+    createSchema: z.object({
+      code: z.string().min(1).max(50),
+      name: z.string().min(1),
+      contactPerson: z.string().optional(),
+      phone: z.string().optional(),
+      whatsapp: z.string().optional(),
+      email: z.string().email().optional(),
+      address: z.string().optional(),
+      countryId: z.string().uuid().optional(),
+      cityId: z.string().uuid().optional(),
+      areaId: z.string().uuid().optional(),
+      taxNo: z.string().optional(),
+      tradeLicenseNo: z.string().optional(),
+      licenseExpiryDate: z.coerce.date().optional(),
+      currencyId: z.string().uuid().optional(),
+      paymentTermsId: z.string().uuid().optional(),
+      creditLimit: z.number().nonnegative().optional(),
+      bankName: z.string().optional(),
+      bankAccountNo: z.string().optional(),
+      iban: z.string().optional(),
+      rating: z.enum(["Approved", "Pending", "Blacklisted"]).default("Pending"),
+      payableGlId: z.string().uuid().optional(),
+      notes: z.string().optional(),
+    }),
+    include: { country: true, city: true, area: true, paymentTerms: true },
+    sensitiveFields: { fields: ["bankName", "bankAccountNo", "iban"], requiredPermission: "Procurement.Vendor.ViewBankDetails" },
+  })
+);
+
+// --- Material Requests ------------------------------------------------------
+const mrLineSchema = z.object({
+  itemId: z.string().uuid(),
+  requestedQty: z.number().positive(),
+  uomId: z.string().uuid(),
+  requiredDate: z.coerce.date().optional(),
+});
+
+router.get(
+  "/material-requests",
+  requirePermission("Procurement.MaterialRequest.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.branchId) where.branchId = req.query.branchId;
+    if (req.query.status) where.status = req.query.status;
+    const items = await prisma.materialRequest.findMany({
+      where,
+      include: { lines: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/material-requests/:id",
+  requirePermission("Procurement.MaterialRequest.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.materialRequest.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, uom: true } } },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+router.post(
+  "/material-requests",
+  requirePermission("Procurement.MaterialRequest.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      branchId: z.string().uuid(),
+      companyId: z.string().uuid(),
+      warehouseId: z.string().uuid().optional(),
+      sourceType: z.enum(["Branch", "Warehouse", "CentralKitchen", "Direct"]).default("Branch"),
+      requiredDate: z.coerce.date().optional(),
+      lines: z.array(mrLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+
+    const record = await prisma.$transaction(async (tx) => {
+      const mrNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "MaterialRequest",
+        defaultPrefix: "MR",
+      });
+      return tx.materialRequest.create({
+        data: {
+          tenantId,
+          branchId: payload.branchId,
+          warehouseId: payload.warehouseId,
+          sourceType: payload.sourceType,
+          mrNo,
+          requiredDate: payload.requiredDate,
+          lines: {
+            create: payload.lines.map((l) => ({ ...l, tenantId })),
+          },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.post(
+  "/material-requests/:id/submit",
+  requirePermission("Procurement.MaterialRequest.Submit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") throw ApiError.badRequest(`Cannot submit MR in status ${existing.status}`);
+    const record = await prisma.materialRequest.update({ where: { id: existing.id }, data: { status: "Submitted" } });
+    await triggerApproval(prisma, { tenantId, moduleCode: "Procurement.MaterialRequest", recordId: record.id });
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.MaterialRequest",
+      recordTable: "material_requests",
+      recordId: record.id,
+      action: "Submitted",
+    });
+    res.json(record);
+  })
+);
+
+router.post(
+  "/material-requests/:id/approve",
+  requirePermission("Procurement.MaterialRequest.Approve"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      lineApprovals: z.array(z.object({ lineId: z.string().uuid(), approvedQty: z.number().nonnegative() })).optional(),
+    });
+    const { lineApprovals } = schema.parse(req.body);
+
+    const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Submitted") throw ApiError.badRequest(`Cannot approve MR in status ${existing.status}`);
+
+    await prisma.$transaction(async (tx) => {
+      if (lineApprovals) {
+        for (const la of lineApprovals) {
+          await tx.materialRequestLine.update({ where: { id: la.lineId }, data: { approvedQty: la.approvedQty } });
+        }
+      } else {
+        await tx.materialRequestLine.updateMany({
+          where: { mrId: existing.id },
+          data: {}, // no-op; approvedQty left null means "approved as requested" by convention
+        });
+      }
+      await tx.materialRequest.update({ where: { id: existing.id }, data: { status: "Approved" } });
+    });
+
+    const record = await prisma.materialRequest.findUnique({ where: { id: existing.id }, include: { lines: true } });
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.MaterialRequest",
+      recordTable: "material_requests",
+      recordId: existing.id,
+      action: "Approved",
+    });
+    res.json(record);
+  })
+);
+
+// --- MR Consolidation -------------------------------------------------------
+
+/**
+ * Head-office view: every approved MR line across every branch (not just
+ * one), grouped by item, so head office can see total tenant-wide demand
+ * for an item before deciding whether to consolidate it into a purchase
+ * (External -> RFQ/PO) or pull it from another branch's stock instead
+ * (Internal -> inter-branch transfer). Lines already picked into an active
+ * consolidation are excluded so nothing gets consolidated twice.
+ */
+router.get(
+  "/material-requests/consolidation-pool",
+  requirePermission("Procurement.MrConsolidation.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const status = typeof req.query.status === "string" ? req.query.status : "Approved";
+
+    const alreadyConsolidated = await prisma.mrConsolidationLine.findMany({
+      where: { tenantId, consolidation: { status: { not: "Cancelled" } } },
+      select: { mrLineId: true },
+    });
+    const excludeLineIds = alreadyConsolidated.map((l) => l.mrLineId);
+
+    const lines = await prisma.materialRequestLine.findMany({
+      where: { tenantId, id: { notIn: excludeLineIds }, mr: { status } },
+      include: { item: true, uom: true, mr: { include: { branch: true } } },
+      orderBy: { requiredDate: "asc" },
+    });
+
+    const byItem = new Map<
+      string,
+      { itemId: string; itemCode: string; itemName: string; uomCode: string; totalQty: number; branches: unknown[] }
+    >();
+    for (const line of lines) {
+      const qty = Number(line.approvedQty ?? line.requestedQty);
+      if (!byItem.has(line.itemId)) {
+        byItem.set(line.itemId, {
+          itemId: line.itemId,
+          itemCode: line.item.code,
+          itemName: line.item.name,
+          uomCode: line.uom.code,
+          totalQty: 0,
+          branches: [],
+        });
+      }
+      const entry = byItem.get(line.itemId)!;
+      entry.totalQty += qty;
+      entry.branches.push({
+        branchId: line.mr.branchId,
+        branchName: line.mr.branch.name,
+        mrId: line.mrId,
+        mrNo: line.mr.mrNo,
+        mrLineId: line.id,
+        qty,
+      });
+    }
+
+    res.json({ data: Array.from(byItem.values()) });
+  })
+);
+
+router.post(
+  "/mr-consolidations",
+  requirePermission("Procurement.MrConsolidation.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      fulfillmentType: z.enum(["External", "Internal"]).default("External"),
+      mrLineIds: z.array(z.string().uuid()).min(1),
+    });
+    const payload = schema.parse(req.body);
+
+    const lines = await prisma.materialRequestLine.findMany({
+      where: { id: { in: payload.mrLineIds }, tenantId },
+    });
+    if (lines.length !== payload.mrLineIds.length) {
+      throw ApiError.badRequest("One or more MR lines not found");
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const consolidationNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "MrConsolidation",
+        defaultPrefix: "CONS",
+      });
+      return tx.mrConsolidation.create({
+        data: {
+          tenantId,
+          consolidationNo,
+          fulfillmentType: payload.fulfillmentType,
+          lines: {
+            create: lines.map((l) => ({
+              tenantId,
+              mrId: l.mrId,
+              mrLineId: l.id,
+              itemId: l.itemId,
+              qty: l.approvedQty ?? l.requestedQty,
+            })),
+          },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/mr-consolidations",
+  requirePermission("Procurement.MrConsolidation.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.fulfillmentType) where.fulfillmentType = req.query.fulfillmentType;
+    const items = await prisma.mrConsolidation.findMany({ where, include: { lines: true } });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/mr-consolidations/:id",
+  requirePermission("Procurement.MrConsolidation.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.mrConsolidation.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, mr: { include: { branch: true } } } } },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+/**
+ * Converts an Internal-fulfillment consolidation into inter-branch
+ * transfers - one transfer per destination branch, since a transfer moves
+ * stock into a single branch/warehouse. All lines are drawn from one
+ * supplying branch/warehouse.
+ */
+router.post(
+  "/mr-consolidations/:id/convert-to-transfer",
+  requirePermission("Procurement.MrConsolidation.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      fromBranchId: z.string().uuid(),
+      fromWarehouseId: z.string().uuid(),
+      // destination warehouse to receive into, keyed by the requesting branch's id
+      toWarehouseByBranch: z.record(z.string().uuid()),
+    });
+    const payload = schema.parse(req.body);
+
+    const consolidation = await prisma.mrConsolidation.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { mr: true } } },
+    });
+    if (!consolidation) throw ApiError.notFound();
+    if (consolidation.fulfillmentType !== "Internal") {
+      throw ApiError.badRequest("This consolidation is marked External - convert it via RFQ/PO instead");
+    }
+
+    const fromBranch = await prisma.branch.findFirst({ where: { id: payload.fromBranchId, tenantId } });
+    if (!fromBranch) throw ApiError.badRequest("fromBranchId not found");
+
+    const byBranch = new Map<string, typeof consolidation.lines>();
+    for (const line of consolidation.lines) {
+      const branchId = line.mr.branchId;
+      byBranch.set(branchId, [...(byBranch.get(branchId) ?? []), line]);
+    }
+
+    const createdTransfers = await prisma.$transaction(async (tx) => {
+      const transfers = [];
+      for (const [branchId, lines] of byBranch) {
+        const toWarehouseId = payload.toWarehouseByBranch[branchId];
+        if (!toWarehouseId) throw ApiError.badRequest(`Missing destination warehouse for branch ${branchId}`);
+
+        const transferNo = await nextDocumentNumber(tx, {
+          tenantId,
+          companyId: fromBranch.companyId,
+          moduleCode: "StockTransfer",
+          defaultPrefix: "IBT",
+        });
+        const transfer = await tx.stockTransfer.create({
+          data: {
+            tenantId,
+            transferNo,
+            fromBranchId: payload.fromBranchId,
+            toBranchId: branchId,
+            fromWarehouseId: payload.fromWarehouseId,
+            toWarehouseId,
+            sourceConsolidationId: consolidation.id,
+            lines: {
+              create: lines.map((l) => ({
+                tenantId,
+                itemId: l.itemId,
+                qty: l.qty,
+                sourceMrConsolidationLineId: l.id,
+              })),
+            },
+          },
+          include: { lines: true },
+        });
+        transfers.push(transfer);
+      }
+      await tx.mrConsolidation.update({ where: { id: consolidation.id }, data: { status: "Converted" } });
+      return transfers;
+    });
+
+    res.status(201).json({ consolidationId: consolidation.id, stockTransfers: createdTransfers });
+  })
+);
+
+// --- RFQ (Request for Quotation) ---------------------------------------------
+// Not in the original blueprint - added at the user's request as a step
+// between MR consolidation and PO: send the same lines to several vendors,
+// record what each one quotes, mark the winning quote per line, then
+// convert the selected quotes straight into a PO (one PO per vendor, since
+// a PO belongs to a single vendor).
+const rfqLineSchema = z.object({
+  itemId: z.string().uuid(),
+  qty: z.number().positive(),
+  uomId: z.string().uuid(),
+  sourceMrLineId: z.string().uuid().optional(),
+});
+
+router.post(
+  "/rfqs",
+  requirePermission("Procurement.Rfq.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      branchId: z.string().uuid().optional(),
+      notes: z.string().optional(),
+      lines: z.array(rfqLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+
+    const record = await prisma.$transaction(async (tx) => {
+      const rfqNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "Rfq",
+        defaultPrefix: "RFQ",
+      });
+      return tx.rfq.create({
+        data: {
+          tenantId,
+          rfqNo,
+          branchId: payload.branchId,
+          notes: payload.notes,
+          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/rfqs",
+  requirePermission("Procurement.Rfq.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.status) where.status = req.query.status;
+    const items = await prisma.rfq.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/rfqs/:id",
+  requirePermission("Procurement.Rfq.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.rfq.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, uom: true, quotes: { include: { vendor: true } } } } },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+router.post(
+  "/rfqs/:id/send",
+  requirePermission("Procurement.Rfq.Submit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.rfq.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") throw ApiError.badRequest(`Cannot send RFQ in status ${existing.status}`);
+    const record = await prisma.rfq.update({ where: { id: existing.id }, data: { status: "Sent" } });
+    res.json(record);
+  })
+);
+
+/** Records or updates one vendor's quoted price/lead time against one RFQ line. */
+router.post(
+  "/rfqs/:id/quotes",
+  requirePermission("Procurement.Rfq.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const rfq = await prisma.rfq.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!rfq) throw ApiError.notFound();
+
+    const schema = z.object({
+      rfqLineId: z.string().uuid(),
+      vendorId: z.string().uuid(),
+      quotedPrice: z.number().nonnegative(),
+      leadTimeDays: z.number().int().nonnegative().optional(),
+      notes: z.string().optional(),
+    });
+    const payload = schema.parse(req.body);
+
+    const record = await prisma.rfqVendorQuote.upsert({
+      where: { rfqLineId_vendorId: { rfqLineId: payload.rfqLineId, vendorId: payload.vendorId } },
+      update: { quotedPrice: payload.quotedPrice, leadTimeDays: payload.leadTimeDays, notes: payload.notes },
+      create: { ...payload, tenantId, rfqId: rfq.id },
+    });
+    res.status(201).json(record);
+  })
+);
+
+/** Marks the winning quote(s) - the ones that will be converted into a PO. */
+router.post(
+  "/rfqs/:id/select",
+  requirePermission("Procurement.Rfq.Approve"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const rfq = await prisma.rfq.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!rfq) throw ApiError.notFound();
+
+    const schema = z.object({ quoteIds: z.array(z.string().uuid()).min(1) });
+    const { quoteIds } = schema.parse(req.body);
+
+    await prisma.$transaction(async (tx) => {
+      const quotes = await tx.rfqVendorQuote.findMany({ where: { id: { in: quoteIds }, tenantId, rfqId: rfq.id } });
+      if (quotes.length !== quoteIds.length) throw ApiError.badRequest("One or more quotes not found on this RFQ");
+      // A line can only have one winner, so clear any prior selection on the same lines first.
+      const lineIds = quotes.map((q) => q.rfqLineId);
+      await tx.rfqVendorQuote.updateMany({ where: { rfqLineId: { in: lineIds } }, data: { isSelected: false } });
+      await tx.rfqVendorQuote.updateMany({ where: { id: { in: quoteIds } }, data: { isSelected: true } });
+    });
+
+    const record = await prisma.rfq.findUnique({
+      where: { id: rfq.id },
+      include: { lines: { include: { quotes: { include: { vendor: true } } } } },
+    });
+    res.json(record);
+  })
+);
+
+/**
+ * Converts every selected quote on this RFQ into purchase orders - one PO
+ * per vendor, since a PO belongs to a single vendor. Closes the RFQ once
+ * converted.
+ */
+router.post(
+  "/rfqs/:id/convert-to-po",
+  requirePermission("Procurement.Rfq.Approve"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid(), branchId: z.string().uuid() });
+    const { companyId, branchId } = schema.parse(req.body);
+
+    const rfq = await prisma.rfq.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { quotes: { where: { isSelected: true } } } } },
+    });
+    if (!rfq) throw ApiError.notFound();
+
+    const selectedLines = rfq.lines.filter((l) => l.quotes.length > 0);
+    if (selectedLines.length === 0) throw ApiError.badRequest("No selected quotes to convert - call /select first");
+
+    const byVendor = new Map<string, typeof selectedLines>();
+    for (const line of selectedLines) {
+      const vendorId = line.quotes[0].vendorId;
+      byVendor.set(vendorId, [...(byVendor.get(vendorId) ?? []), line]);
+    }
+
+    const createdPOs = await prisma.$transaction(async (tx) => {
+      const pos = [];
+      for (const [vendorId, lines] of byVendor) {
+        const poLines = lines.map((line) => ({
+          tenantId,
+          itemId: line.itemId,
+          qty: line.qty,
+          uomId: line.uomId,
+          unitPrice: line.quotes[0].quotedPrice,
+          sourceRfqLineId: line.id,
+        }));
+        const totalAmount = poLines.reduce((sum, l) => sum + Number(l.qty) * Number(l.unitPrice), 0);
+        const poNo = await nextDocumentNumber(tx, { tenantId, companyId, moduleCode: "PurchaseOrder", defaultPrefix: "PO" });
+        const po = await tx.purchaseOrder.create({
+          data: { tenantId, poNo, vendorId, branchId, totalAmount, lines: { create: poLines } },
+          include: { lines: true },
+        });
+        pos.push(po);
+      }
+      await tx.rfq.update({ where: { id: rfq.id }, data: { status: "Closed" } });
+      return pos;
+    });
+
+    res.status(201).json({ rfqId: rfq.id, purchaseOrders: createdPOs });
+  })
+);
+
+// --- Purchase Orders ---------------------------------------------------------
+const poLineSchema = z.object({
+  itemId: z.string().uuid(),
+  qty: z.number().positive(),
+  uomId: z.string().uuid(),
+  unitPrice: z.number().nonnegative(),
+  taxId: z.string().uuid().optional(),
+  sourceMrId: z.string().uuid().optional(),
+  sourceMrLineId: z.string().uuid().optional(),
+});
+
+router.post(
+  "/purchase-orders",
+  requirePermission("Procurement.PurchaseOrder.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      vendorId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      lines: z.array(poLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+    const totalAmount = payload.lines.reduce((sum, l) => sum + l.qty * l.unitPrice, 0);
+
+    const record = await prisma.$transaction(async (tx) => {
+      const poNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "PurchaseOrder",
+        defaultPrefix: "PO",
+      });
+      return tx.purchaseOrder.create({
+        data: {
+          tenantId,
+          poNo,
+          vendorId: payload.vendorId,
+          branchId: payload.branchId,
+          totalAmount,
+          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/purchase-orders",
+  requirePermission("Procurement.PurchaseOrder.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.status) where.status = req.query.status;
+    if (req.query.vendorId) where.vendorId = req.query.vendorId;
+    const items = await prisma.purchaseOrder.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/purchase-orders/:id",
+  requirePermission("Procurement.PurchaseOrder.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.purchaseOrder.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, uom: true, tax: true } }, grns: true },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+router.post(
+  "/purchase-orders/:id/submit",
+  requirePermission("Procurement.PurchaseOrder.Submit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const record = await prisma.purchaseOrder.update({ where: { id: existing.id }, data: { status: "Submitted" } });
+    await triggerApproval(prisma, {
+      tenantId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordId: record.id,
+      amount: Number(record.totalAmount),
+    });
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordTable: "purchase_orders",
+      recordId: record.id,
+      action: "Submitted",
+    });
+    res.json(record);
+  })
+);
+
+router.post(
+  "/purchase-orders/:id/approve",
+  requirePermission("Procurement.PurchaseOrder.Approve"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const record = await prisma.purchaseOrder.update({
+      where: { id: existing.id },
+      data: { status: "Approved", approvalStatus: "Approved" },
+    });
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordTable: "purchase_orders",
+      recordId: record.id,
+      action: "Approved",
+    });
+    res.json(record);
+  })
+);
+
+// --- GRN (Goods Receipt Note) ------------------------------------------------
+const grnLineSchema = z.object({
+  poLineId: z.string().uuid().optional(),
+  itemId: z.string().uuid(),
+  receivedQty: z.number().positive(),
+  acceptedQty: z.number().nonnegative(),
+  rejectedQty: z.number().nonnegative().default(0),
+  batchNo: z.string().optional(),
+  expiryDate: z.coerce.date().optional(),
+  unitCost: z.number().nonnegative().optional(),
+});
+
+router.post(
+  "/grns",
+  requirePermission("Procurement.Grn.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      poId: z.string().uuid().optional(),
+      vendorId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      warehouseId: z.string().uuid(),
+      lines: z.array(grnLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+
+    for (const l of payload.lines) {
+      if (l.acceptedQty + l.rejectedQty > l.receivedQty + 1e-9) {
+        throw ApiError.badRequest("accepted + rejected quantity cannot exceed received quantity", l);
+      }
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const grnNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "GRN",
+        defaultPrefix: "GRN",
+      });
+      return tx.grn.create({
+        data: {
+          tenantId,
+          grnNo,
+          poId: payload.poId,
+          vendorId: payload.vendorId,
+          branchId: payload.branchId,
+          warehouseId: payload.warehouseId,
+          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/grns",
+  requirePermission("Procurement.Grn.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.status) where.status = req.query.status;
+    if (req.query.poId) where.poId = req.query.poId;
+    const items = await prisma.grn.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/grns/:id",
+  requirePermission("Procurement.Grn.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.grn.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, poLine: true } } },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+/**
+ * Posts the GRN: appends stock_ledger rows for each accepted line (weighted
+ * average costing), and books a provisional GL entry Dr Inventory Asset /
+ * Cr GRN Clearing (accrual) - matching BRD 5.9 "GRN accrual", settled later
+ * when the purchase invoice is matched and posted.
+ */
+router.post(
+  "/grns/:id/post",
+  requirePermission("Procurement.Grn.Post"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid() });
+    const { companyId } = schema.parse(req.body);
+
+    const grn = await prisma.grn.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!grn) throw ApiError.notFound();
+    if (grn.status !== "Draft") throw ApiError.badRequest(`GRN already ${grn.status}`);
+
+    const linesWithDetail = await prisma.grnLine.findMany({
+      where: { grnId: grn.id },
+      include: { item: { include: { glMapping: true } }, poLine: true },
+    });
+
+    await prisma.$transaction(async (tx) => {
+      let totalValue = 0;
+      const grnClearing = await resolveCoaByCode(tx, tenantId, companyId, "GRN-CLEARING");
+
+      for (const line of linesWithDetail) {
+        if (line.acceptedQty <= 0) continue;
+        const unitCost = line.unitCost && Number(line.unitCost) > 0
+          ? Number(line.unitCost)
+          : line.poLine
+          ? Number(line.poLine.unitPrice)
+          : 0;
+
+        await postStockMovement(tx, {
+          tenantId,
+          itemId: line.itemId,
+          warehouseId: grn.warehouseId,
+          batchNo: line.batchNo,
+          expiryDate: line.expiryDate,
+          qtyIn: Number(line.acceptedQty),
+          unitCost,
+          sourceModule: "Procurement",
+          sourceDocType: "GRN",
+          sourceDocId: grn.id,
+        });
+
+        totalValue += Number(line.acceptedQty) * unitCost;
+      }
+
+      if (grnClearing && totalValue > 0) {
+        // Simplified: post the whole GRN value against a single generic
+        // inventory control account, since items may span multiple GL
+        // mappings - a per-line posting_rule engine is the natural Phase 2
+        // upgrade (ERD blueprint section 12 "Posting engine").
+        const inventoryControl = await resolveCoaByCode(tx, tenantId, companyId, "INVENTORY-CONTROL");
+        if (inventoryControl) {
+          await postJournal(tx, {
+            tenantId,
+            companyId,
+            sourceModule: "Procurement",
+            sourceDocId: grn.id,
+            lines: [
+              { accountId: inventoryControl.id, debit: totalValue },
+              { accountId: grnClearing.id, credit: totalValue },
+            ],
+          });
+        } else {
+          await recordPostingException(tx, {
+            tenantId,
+            sourceModule: "Procurement",
+            sourceDocId: grn.id,
+            exceptionType: "Missing GL",
+            message: "INVENTORY-CONTROL account not configured for this company",
+          });
+        }
+      } else if (!grnClearing && totalValue > 0) {
+        await recordPostingException(tx, {
+          tenantId,
+          sourceModule: "Procurement",
+          sourceDocId: grn.id,
+          exceptionType: "Missing GL",
+          message: "GRN-CLEARING account not configured for this company",
+        });
+      }
+
+      await tx.grn.update({ where: { id: grn.id }, data: { status: "Posted", qcStatus: "Accepted" } });
+
+      if (grn.poId) {
+        const poLines = await tx.purchaseOrderLine.findMany({ where: { poId: grn.poId } });
+        const grnLines = await tx.grnLine.findMany({ where: { grn: { poId: grn.poId } } });
+        const fullyReceived = poLines.every((pl) => {
+          const receivedForLine = grnLines
+            .filter((gl) => gl.poLineId === pl.id)
+            .reduce((s, gl) => s + Number(gl.acceptedQty), 0);
+          return receivedForLine >= Number(pl.qty) - 1e-6;
+        });
+        await tx.purchaseOrder.update({
+          where: { id: grn.poId },
+          data: { status: fullyReceived ? "Closed" : "Partially Received" },
+        });
+      }
+    });
+
+    const updated = await prisma.grn.findUnique({ where: { id: grn.id }, include: { lines: true } });
+    res.json(updated);
+  })
+);
+
+// --- Goods Return (GRV) - return goods to a vendor -----------------------------
+// Per Screen Spec: "Return goods to vendor ... return qty cannot exceed
+// available accepted qty. Posts negative stock and debit note if invoiced."
+const goodsReturnLineSchema = z.object({
+  grnLineId: z.string().uuid().optional(),
+  itemId: z.string().uuid(),
+  batchNo: z.string().optional(),
+  returnQty: z.number().positive(),
+  unitCost: z.number().nonnegative().optional(),
+  reason: z.string().optional(),
+});
+
+router.post(
+  "/goods-returns",
+  requirePermission("Procurement.GoodsReturn.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      grnId: z.string().uuid().optional(),
+      vendorId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      warehouseId: z.string().uuid(),
+      reason: z.string().optional(),
+      lines: z.array(goodsReturnLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+
+    // Validate: return qty (this request + anything already returned against
+    // the same GRN line) cannot exceed that GRN line's accepted qty.
+    for (const line of payload.lines) {
+      if (!line.grnLineId) continue;
+      const grnLine = await prisma.grnLine.findFirst({ where: { id: line.grnLineId, tenantId } });
+      if (!grnLine) throw ApiError.badRequest(`GRN line ${line.grnLineId} not found`);
+      const alreadyReturned = await prisma.goodsReturnLine.aggregate({
+        where: { tenantId, grnLineId: line.grnLineId, goodsReturn: { status: { not: "Cancelled" } } },
+        _sum: { returnQty: true },
+      });
+      const returnedSoFar = Number(alreadyReturned._sum.returnQty ?? 0);
+      if (returnedSoFar + line.returnQty > Number(grnLine.acceptedQty) + 1e-9) {
+        throw ApiError.badRequest(
+          `Return qty for item exceeds available accepted qty (accepted ${grnLine.acceptedQty}, already returned ${returnedSoFar})`
+        );
+      }
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const returnNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "GoodsReturn",
+        defaultPrefix: "GRV",
+      });
+      return tx.goodsReturn.create({
+        data: {
+          tenantId,
+          returnNo,
+          grnId: payload.grnId,
+          vendorId: payload.vendorId,
+          branchId: payload.branchId,
+          warehouseId: payload.warehouseId,
+          reason: payload.reason,
+          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+        },
+        include: { lines: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/goods-returns",
+  requirePermission("Procurement.GoodsReturn.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.vendorId) where.vendorId = req.query.vendorId;
+    if (req.query.status) where.status = req.query.status;
+    const items = await prisma.goodsReturn.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+router.get(
+  "/goods-returns/:id",
+  requirePermission("Procurement.GoodsReturn.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.goodsReturn.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { item: true, grnLine: true } }, vendor: true },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
+  })
+);
+
+/**
+ * Posts the goods return: appends a negative stock movement (qtyOut) at the
+ * item's current average cost for each line, then - if the source GRN was
+ * already matched to a posted purchase invoice - raises and posts a debit
+ * note against the vendor for the returned value (Dr Accounts Payable /
+ * Cr GRN Clearing), reducing what's owed to them.
+ */
+router.post(
+  "/goods-returns/:id/post",
+  requirePermission("Procurement.GoodsReturn.Post"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid() });
+    const { companyId } = schema.parse(req.body);
+
+    const goodsReturn = await prisma.goodsReturn.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!goodsReturn) throw ApiError.notFound();
+    if (goodsReturn.status !== "Draft") throw ApiError.badRequest(`Goods return already ${goodsReturn.status}`);
+
+    const linesWithDetail = await prisma.goodsReturnLine.findMany({
+      where: { goodsReturnId: goodsReturn.id },
+      include: { item: true },
+    });
+
+    // If the source GRN is already covered by a posted purchase invoice, the
+    // return needs a debit note rather than just a stock reversal.
+    const invoicedGrnBridge = goodsReturn.grnId
+      ? await prisma.purchaseInvoiceGrn.findFirst({
+          where: { grnId: goodsReturn.grnId, tenantId, purchaseInvoice: { postingStatus: "Posted" } },
+          include: { purchaseInvoice: true },
+        })
+      : null;
+
+    const result = await prisma.$transaction(async (tx) => {
+      let totalValue = 0;
+      for (const line of linesWithDetail) {
+        const unitCost =
+          line.unitCost && Number(line.unitCost) > 0
+            ? Number(line.unitCost)
+            : line.item.averageCost
+            ? Number(line.item.averageCost)
+            : 0;
+
+        await postStockMovement(tx, {
+          tenantId,
+          itemId: line.itemId,
+          warehouseId: goodsReturn.warehouseId,
+          batchNo: line.batchNo,
+          qtyOut: Number(line.returnQty),
+          sourceModule: "Procurement",
+          sourceDocType: "GoodsReturn",
+          sourceDocId: goodsReturn.id,
+        });
+
+        totalValue += Number(line.returnQty) * unitCost;
+      }
+
+      await tx.goodsReturn.update({ where: { id: goodsReturn.id }, data: { status: "Posted" } });
+
+      if (!invoicedGrnBridge || totalValue <= 0) {
+        return { debitNote: null };
+      }
+
+      const debitNoteNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId,
+        moduleCode: "VendorDebitNote",
+        defaultPrefix: "DN",
+      });
+      const debitNote = await tx.vendorDebitNote.create({
+        data: {
+          tenantId,
+          debitNoteNo,
+          vendorId: goodsReturn.vendorId,
+          goodsReturnId: goodsReturn.id,
+          purchaseInvoiceId: invoicedGrnBridge.purchaseInvoiceId,
+          amount: totalValue,
+        },
+      });
+
+      const grnClearing = await resolveCoaByCode(tx, tenantId, companyId, "GRN-CLEARING");
+      const vendor = await tx.vendor.findUnique({ where: { id: goodsReturn.vendorId } });
+      const apControl =
+        (vendor?.payableGlId && (await tx.chartOfAccount.findUnique({ where: { id: vendor.payableGlId } }))) ||
+        (await resolveCoaByCode(tx, tenantId, companyId, "AP-CONTROL"));
+
+      if (grnClearing && apControl) {
+        await postJournal(tx, {
+          tenantId,
+          companyId,
+          sourceModule: "Procurement",
+          sourceDocId: debitNote.id,
+          lines: [
+            { accountId: apControl.id, debit: totalValue },
+            { accountId: grnClearing.id, credit: totalValue },
+          ],
+        });
+        await tx.vendorDebitNote.update({ where: { id: debitNote.id }, data: { postingStatus: "Posted" } });
+      } else {
+        await recordPostingException(tx, {
+          tenantId,
+          sourceModule: "Procurement",
+          sourceDocId: debitNote.id,
+          exceptionType: "Missing GL",
+          message: "GRN-CLEARING or AP-CONTROL account not configured for this company",
+        });
+      }
+
+      return { debitNote };
+    });
+
+    const updated = await prisma.goodsReturn.findUnique({ where: { id: goodsReturn.id }, include: { lines: true } });
+    res.json({ ...updated, debitNote: result.debitNote });
+  })
+);
+
+// --- Vendor Debit Notes (read-only API - created automatically by
+// goods-returns/:id/post when the returned goods were already invoiced) ----
+router.get(
+  "/vendor-debit-notes",
+  requirePermission("Procurement.VendorDebitNote.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.vendorId) where.vendorId = req.query.vendorId;
+    const items = await prisma.vendorDebitNote.findMany({ where, orderBy: { createdAt: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+// --- Purchase Invoices --------------------------------------------------------
+router.post(
+  "/purchase-invoices",
+  requirePermission("Procurement.PurchaseInvoice.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      vendorId: z.string().uuid(),
+      invoiceNo: z.string().min(1),
+      invoiceDate: z.coerce.date().optional(),
+      gross: z.number().nonnegative(),
+      tax: z.number().nonnegative().default(0),
+      grnIds: z.array(z.string().uuid()).min(1),
+    });
+    const payload = schema.parse(req.body);
+    const net = payload.gross + payload.tax;
+
+    const duplicate = await prisma.purchaseInvoice.findFirst({
+      where: { tenantId, vendorId: payload.vendorId, invoiceNo: payload.invoiceNo },
+    });
+    if (duplicate) throw ApiError.conflict("Duplicate vendor invoice number");
+
+    const record = await prisma.purchaseInvoice.create({
+      data: {
+        tenantId,
+        vendorId: payload.vendorId,
+        invoiceNo: payload.invoiceNo,
+        invoiceDate: payload.invoiceDate,
+        gross: payload.gross,
+        tax: payload.tax,
+        net,
+        grns: { create: payload.grnIds.map((grnId) => ({ tenantId, grnId })) },
+      },
+      include: { grns: { include: { grn: { include: { lines: true } } } } },
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/purchase-invoices",
+  requirePermission("Procurement.PurchaseInvoice.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const items = await prisma.purchaseInvoice.findMany({
+      where: { tenantId },
+      include: { grns: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ data: items });
+  })
+);
+
+/**
+ * Posts the purchase invoice after a three-way match (PO price/qty vs GRN
+ * accepted qty vs invoice amount, within TOLERANCE_PCT) - BRD 5.4: "Purchase
+ * invoice with PO-GRN-invoice three-way matching, amount/quantity tolerance
+ * ... and GL posting." Books Dr GRN Clearing / Cr Accounts Payable.
+ */
+router.post(
+  "/purchase-invoices/:id/post",
+  requirePermission("Procurement.PurchaseInvoice.Post"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid() });
+    const { companyId } = schema.parse(req.body);
+
+    const invoice = await prisma.purchaseInvoice.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: {
+        vendor: true,
+        grns: { include: { grn: { include: { lines: { include: { poLine: true } } } } } },
+      },
+    });
+    if (!invoice) throw ApiError.notFound();
+    if (invoice.postingStatus === "Posted") throw ApiError.badRequest("Invoice already posted");
+
+    const expectedAmount = invoice.grns.reduce((sum, bridge) => {
+      const linesTotal = bridge.grn.lines.reduce((s, l) => {
+        const price = l.poLine ? Number(l.poLine.unitPrice) : Number(l.unitCost ?? 0);
+        return s + Number(l.acceptedQty) * price;
+      }, 0);
+      return sum + linesTotal;
+    }, 0);
+
+    const variance = expectedAmount === 0 ? 0 : Math.abs(Number(invoice.gross) - expectedAmount) / expectedAmount;
+    if (variance > TOLERANCE_PCT) {
+      throw ApiError.badRequest(
+        `Invoice amount ${invoice.gross} exceeds tolerance vs matched GRN value ${expectedAmount.toFixed(2)} (variance ${(variance * 100).toFixed(1)}%)`,
+        { expectedAmount, invoiceGross: invoice.gross, tolerancePct: TOLERANCE_PCT }
+      );
+    }
+
+    await prisma.$transaction(async (tx) => {
+      const grnClearing = await resolveCoaByCode(tx, tenantId, companyId, "GRN-CLEARING");
+      const apControl =
+        (invoice.vendor.payableGlId && (await tx.chartOfAccount.findUnique({ where: { id: invoice.vendor.payableGlId } }))) ||
+        (await resolveCoaByCode(tx, tenantId, companyId, "AP-CONTROL"));
+
+      if (grnClearing && apControl) {
+        await postJournal(tx, {
+          tenantId,
+          companyId,
+          sourceModule: "Procurement",
+          sourceDocId: invoice.id,
+          lines: [
+            { accountId: grnClearing.id, debit: Number(invoice.net) },
+            { accountId: apControl.id, credit: Number(invoice.net) },
+          ],
+        });
+      } else {
+        await recordPostingException(tx, {
+          tenantId,
+          sourceModule: "Procurement",
+          sourceDocId: invoice.id,
+          exceptionType: "Missing GL",
+          message: "GRN-CLEARING or AP-CONTROL account not configured for this company",
+        });
+      }
+
+      await tx.purchaseInvoice.update({ where: { id: invoice.id }, data: { postingStatus: "Posted" } });
+    });
+
+    const updated = await prisma.purchaseInvoice.findUnique({ where: { id: invoice.id } });
+    res.json(updated);
+  })
+);
+
+// --- Vendor Payments -----------------------------------------------------------
+router.post(
+  "/vendor-payments",
+  requirePermission("Procurement.VendorPayment.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      vendorId: z.string().uuid(),
+      amount: z.number().positive(),
+      paymentMethodId: z.string().uuid(),
+      bankAccountId: z.string().uuid().optional(),
+      mode: z.enum(["Invoice", "Advance"]).default("Invoice"),
+      invoices: z.array(z.object({ purchaseInvoiceId: z.string().uuid(), appliedAmount: z.number().positive() })).optional(),
+      chequeNo: z.string().optional(),
+      chequeDate: z.coerce.date().optional(),
+    });
+    const payload = schema.parse(req.body);
+
+    if (payload.mode === "Invoice") {
+      if (!payload.invoices || payload.invoices.length === 0) {
+        throw ApiError.badRequest("Invoice-mode payment needs at least one invoice to apply against");
+      }
+      const appliedTotal = payload.invoices.reduce((s, i) => s + i.appliedAmount, 0);
+      if (Math.abs(appliedTotal - payload.amount) > 0.01) {
+        throw ApiError.badRequest("Sum of applied amounts must equal the payment amount");
+      }
+    } else if (payload.invoices && payload.invoices.length > 0) {
+      throw ApiError.badRequest("Advance-mode payment cannot be applied against invoices");
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const paymentNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "VendorPayment",
+        defaultPrefix: "VP",
+      });
+      const paymentMethod = await tx.paymentMethod.findUnique({ where: { id: payload.paymentMethodId } });
+      if (paymentMethod?.type === "Cheque" && !payload.chequeNo) {
+        throw ApiError.badRequest("chequeNo is required when paying by a Cheque-type payment method");
+      }
+      return tx.vendorPayment.create({
+        data: {
+          tenantId,
+          paymentNo,
+          vendorId: payload.vendorId,
+          amount: payload.amount,
+          paymentMethodId: payload.paymentMethodId,
+          bankAccountId: payload.bankAccountId,
+          mode: payload.mode,
+          chequeNo: payload.chequeNo,
+          chequeDate: payload.chequeDate,
+          chequeStatus: paymentMethod?.type === "Cheque" ? "Issued" : undefined,
+          invoices: {
+            create: (payload.invoices ?? []).map((i) => ({ tenantId, purchaseInvoiceId: i.purchaseInvoiceId, appliedAmount: i.appliedAmount })),
+          },
+        },
+        include: { invoices: true },
+      });
+    });
+
+    res.status(201).json(record);
+  })
+);
+
+router.get(
+  "/vendor-payments",
+  requirePermission("Procurement.VendorPayment.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const items = await prisma.vendorPayment.findMany({ where: { tenantId }, include: { invoices: true }, orderBy: { paymentDate: "desc" } });
+    res.json({ data: items });
+  })
+);
+
+/**
+ * Posts the payment. Invoice mode: Dr Accounts Payable / Cr Bank-Cash, per
+ * BRD 5.4. Advance mode: Dr Vendor Advance / Cr Bank-Cash, per BRD 5.9
+ * "vendor advance" - a prepayment sitting as an asset until applied against
+ * a future invoice.
+ */
+router.post(
+  "/vendor-payments/:id/post",
+  requirePermission("Procurement.VendorPayment.Post"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid() });
+    const { companyId } = schema.parse(req.body);
+
+    const payment = await prisma.vendorPayment.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { vendor: true, bankAccount: true },
+    });
+    if (!payment) throw ApiError.notFound();
+    if (payment.postingStatus === "Posted") throw ApiError.badRequest("Payment already posted");
+
+    await prisma.$transaction(async (tx) => {
+      const debitAccount =
+        payment.mode === "Advance"
+          ? await resolveCoaByCode(tx, tenantId, companyId, "VENDOR-ADVANCE")
+          : (payment.vendor.payableGlId && (await tx.chartOfAccount.findUnique({ where: { id: payment.vendor.payableGlId } }))) ||
+            (await resolveCoaByCode(tx, tenantId, companyId, "AP-CONTROL"));
+      const debitAccountLabel = payment.mode === "Advance" ? "VENDOR-ADVANCE" : "AP-CONTROL";
+      const bankAccountId =
+        payment.bankAccount?.accountId ??
+        (await resolveCoaByCode(tx, tenantId, companyId, "CASH-CONTROL"))?.id;
+
+      if (debitAccount && bankAccountId) {
+        await postJournal(tx, {
+          tenantId,
+          companyId,
+          sourceModule: "Procurement",
+          sourceDocId: payment.id,
+          lines: [
+            { accountId: debitAccount.id, debit: Number(payment.amount) },
+            { accountId: bankAccountId, credit: Number(payment.amount) },
+          ],
+        });
+      } else {
+        await recordPostingException(tx, {
+          tenantId,
+          sourceModule: "Procurement",
+          sourceDocId: payment.id,
+          exceptionType: "Missing GL",
+          message: `${debitAccountLabel} or bank/cash account not configured for this company`,
+        });
+      }
+
+      await tx.vendorPayment.update({ where: { id: payment.id }, data: { postingStatus: "Posted" } });
+
+      // Mark fully-paid invoices as such is left to a reporting view over
+      // vendor_payment_invoices vs purchase_invoices.net for MVP.
+    });
+
+    const updated = await prisma.vendorPayment.findUnique({ where: { id: payment.id } });
+    res.json(updated);
+  })
+);
+
+// --- Purchase Reports ---------------------------------------------------------
+// BRD "Reports" module's purchase slice, same rebuildable-from-transactions
+// principle as the Inventory/Sales reports.
+
+/** Spend by vendor over a date range, from posted purchase invoices. */
+router.get(
+  "/reports/vendor-spend",
+  requirePermission("Procurement.Reports.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ fromDate: z.coerce.date(), toDate: z.coerce.date(), vendorId: z.string().uuid().optional() });
+    const { fromDate, toDate, vendorId } = schema.parse(req.query);
+
+    const invoices = await prisma.purchaseInvoice.findMany({
+      where: {
+        tenantId,
+        postingStatus: "Posted",
+        invoiceDate: { gte: fromDate, lte: toDate },
+        ...(vendorId ? { vendorId } : {}),
+      },
+      include: { vendor: true },
+    });
+
+    const byVendor = new Map<string, { vendorId: string; vendorCode: string; vendorName: string; invoiceCount: number; gross: number; tax: number; net: number }>();
+    for (const inv of invoices) {
+      const entry = byVendor.get(inv.vendorId) ?? {
+        vendorId: inv.vendorId,
+        vendorCode: inv.vendor.code,
+        vendorName: inv.vendor.name,
+        invoiceCount: 0,
+        gross: 0,
+        tax: 0,
+        net: 0,
+      };
+      entry.invoiceCount += 1;
+      entry.gross += Number(inv.gross);
+      entry.tax += Number(inv.tax);
+      entry.net += Number(inv.net);
+      byVendor.set(inv.vendorId, entry);
+    }
+
+    res.json({
+      data: [...byVendor.values()].sort((a, b) => b.net - a.net),
+      totalNet: invoices.reduce((s, i) => s + Number(i.net), 0),
+    });
+  })
+);
+
+/**
+ * Purchase price variance: what was actually received (GrnLine.unitCost)
+ * vs. what the PO agreed to (PurchaseOrderLine.unitPrice), per item -
+ * catches vendors drifting prices up between PO and delivery. Only GRN
+ * lines linked back to a PO line are counted (poLineId not null); direct/
+ * unplanned GRNs have no PO price to compare against.
+ */
+router.get(
+  "/reports/price-variance",
+  requirePermission("Procurement.Reports.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      fromDate: z.coerce.date(),
+      toDate: z.coerce.date(),
+      vendorId: z.string().uuid().optional(),
+      itemId: z.string().uuid().optional(),
+    });
+    const { fromDate, toDate, vendorId, itemId } = schema.parse(req.query);
+
+    const lines = await prisma.grnLine.findMany({
+      where: {
+        tenantId,
+        poLineId: { not: null },
+        ...(itemId ? { itemId } : {}),
+        grn: {
+          tenantId,
+          status: "Posted",
+          grnDate: { gte: fromDate, lte: toDate },
+          ...(vendorId ? { vendorId } : {}),
+        },
+      },
+      include: { item: true, poLine: true },
+    });
+
+    const byItem = new Map<string, { itemId: string; itemCode: string; itemName: string; receivedQty: number; poValue: number; actualValue: number; variance: number }>();
+    for (const line of lines) {
+      if (!line.poLine) continue;
+      const qty = Number(line.receivedQty);
+      const poUnitPrice = Number(line.poLine.unitPrice);
+      const actualUnitCost = Number(line.unitCost);
+      const entry = byItem.get(line.itemId) ?? {
+        itemId: line.itemId,
+        itemCode: line.item.code,
+        itemName: line.item.name,
+        receivedQty: 0,
+        poValue: 0,
+        actualValue: 0,
+        variance: 0,
+      };
+      entry.receivedQty += qty;
+      entry.poValue += qty * poUnitPrice;
+      entry.actualValue += qty * actualUnitCost;
+      entry.variance = entry.actualValue - entry.poValue;
+      byItem.set(line.itemId, entry);
+    }
+
+    const data = [...byItem.values()].sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance));
+    res.json({ data, totalVariance: data.reduce((s, r) => s + r.variance, 0) });
+  })
+);
+
+/**
+ * Open pipeline: POs not yet fully received/closed, with ordered-vs-
+ * received quantity per line, plus posted GRNs with no purchase invoice
+ * against them yet (received but not yet billed).
+ */
+router.get(
+  "/reports/po-pipeline",
+  requirePermission("Procurement.Reports.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ branchId: z.string().uuid().optional(), vendorId: z.string().uuid().optional() });
+    const { branchId, vendorId } = schema.parse(req.query);
+
+    const openPOs = await prisma.purchaseOrder.findMany({
+      where: {
+        tenantId,
+        status: { in: ["Submitted", "Approved", "Partially Received"] },
+        ...(branchId ? { branchId } : {}),
+        ...(vendorId ? { vendorId } : {}),
+      },
+      include: { vendor: true, lines: { include: { item: true } } },
+    });
+
+    const poIds = openPOs.map((po) => po.id);
+    const grnLines = poIds.length
+      ? await prisma.grnLine.findMany({ where: { tenantId, poLine: { poId: { in: poIds } } }, include: { poLine: true } })
+      : [];
+    const receivedByPoLine = new Map<string, number>();
+    for (const gl of grnLines) {
+      if (!gl.poLineId) continue;
+      receivedByPoLine.set(gl.poLineId, (receivedByPoLine.get(gl.poLineId) ?? 0) + Number(gl.acceptedQty));
+    }
+
+    const now = Date.now();
+    const pipeline = openPOs.map((po) => ({
+      poId: po.id,
+      poNo: po.poNo,
+      vendorName: po.vendor.name,
+      poDate: po.poDate,
+      daysOpen: Math.floor((now - po.poDate.getTime()) / (1000 * 60 * 60 * 24)),
+      status: po.status,
+      totalAmount: Number(po.totalAmount),
+      lines: po.lines.map((l) => ({
+        itemCode: l.item.code,
+        itemName: l.item.name,
+        orderedQty: Number(l.qty),
+        receivedQty: receivedByPoLine.get(l.id) ?? 0,
+        pendingQty: Number(l.qty) - (receivedByPoLine.get(l.id) ?? 0),
+      })),
+    }));
+
+    const pendingInvoiceGrns = await prisma.grn.findMany({
+      where: {
+        tenantId,
+        status: "Posted",
+        purchaseInvoices: { none: {} },
+        ...(branchId ? { branchId } : {}),
+        ...(vendorId ? { vendorId } : {}),
+      },
+      include: { vendor: true },
+    });
+
+    res.json({
+      openPOs: pipeline,
+      pendingInvoiceGrns: pendingInvoiceGrns.map((g) => ({
+        grnId: g.id,
+        grnNo: g.grnNo,
+        vendorName: g.vendor.name,
+        grnDate: g.grnDate,
+        daysSinceReceipt: Math.floor((now - g.grnDate.getTime()) / (1000 * 60 * 60 * 24)),
+      })),
+    });
+  })
+);
+
+export default router;
