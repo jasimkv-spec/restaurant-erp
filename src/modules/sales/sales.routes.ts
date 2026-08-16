@@ -298,7 +298,7 @@ router.post(
       }
 
       // Resolve posItemCode -> itemId where itemId wasn't supplied directly.
-      const resolvedLines = [];
+      const resolvedLines: any[] = [];
       let lineException: string | null = null;
       for (const line of inv.lines) {
         let itemId = line.itemId;
@@ -741,7 +741,7 @@ router.post(
 
     // Fill in unitPrice from the source invoice line where not supplied, so
     // the eventual credit note reflects what the customer actually paid.
-    const linesResolved = [];
+    const linesResolved: Array<z.infer<typeof salesReturnLineSchema> & { unitPrice: number | undefined }> = [];
     for (const l of payload.lines) {
       let unitPrice = l.unitPrice;
       if (unitPrice === undefined && payload.salesInvoiceId) {

@@ -62,14 +62,14 @@ export interface CrudOptions {
 function maskSensitive<T extends Record<string, any>>(record: T, opts: CrudOptions, req: { user?: any }): T {
   if (!opts.sensitiveFields || !record) return record;
   if (hasPermission(req as any, opts.sensitiveFields.requiredPermission)) return record;
-  const masked = { ...record, _masked: [] as string[] };
+  const masked: Record<string, any> = { ...record, _masked: [] as string[] };
   for (const field of opts.sensitiveFields.fields) {
     if (field in masked) {
       masked[field] = null;
-      masked._masked.push(field);
+      (masked._masked as string[]).push(field);
     }
   }
-  return masked;
+  return masked as T;
 }
 
 export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {

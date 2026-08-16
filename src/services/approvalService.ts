@@ -34,7 +34,7 @@ async function createLevelTasks(tx: Tx, tenantId: string, workflowId: string, re
     distinct: ["userId"],
   });
 
-  const tasks = [];
+  const tasks: any[] = [];
   for (const a of approvers) {
     const task = await tx.approvalTask.create({
       data: { tenantId, workflowId, recordId, level, approverUserId: a.userId, status: "Pending" },

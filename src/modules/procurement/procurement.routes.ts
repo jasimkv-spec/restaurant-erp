@@ -348,6 +348,7 @@ router.post(
     const schema = z.object({
       fromBranchId: z.string().uuid(),
       fromWarehouseId: z.string().uuid(),
+      transitWarehouseId: z.string().uuid(),
       // destination warehouse to receive into, keyed by the requesting branch's id
       toWarehouseByBranch: z.record(z.string().uuid()),
     });
@@ -365,14 +366,21 @@ router.post(
     const fromBranch = await prisma.branch.findFirst({ where: { id: payload.fromBranchId, tenantId } });
     if (!fromBranch) throw ApiError.badRequest("fromBranchId not found");
 
+    const transitWarehouse = await prisma.warehouse.findFirst({ where: { id: payload.transitWarehouseId, tenantId } });
+    if (!transitWarehouse) throw ApiError.badRequest("transitWarehouseId not found");
+    if (!transitWarehouse.isInTransit) {
+      throw ApiError.badRequest("transitWarehouseId must point to a warehouse flagged isInTransit = true");
+    }
+
     const byBranch = new Map<string, typeof consolidation.lines>();
     for (const line of consolidation.lines) {
+      if (!line.mr) throw ApiError.badRequest(`Consolidation line ${line.id} has no linked material request`);
       const branchId = line.mr.branchId;
       byBranch.set(branchId, [...(byBranch.get(branchId) ?? []), line]);
     }
 
     const createdTransfers = await prisma.$transaction(async (tx) => {
-      const transfers = [];
+      const transfers: any[] = [];
       for (const [branchId, lines] of byBranch) {
         const toWarehouseId = payload.toWarehouseByBranch[branchId];
         if (!toWarehouseId) throw ApiError.badRequest(`Missing destination warehouse for branch ${branchId}`);
@@ -391,6 +399,7 @@ router.post(
             toBranchId: branchId,
             fromWarehouseId: payload.fromWarehouseId,
             toWarehouseId,
+            transitWarehouseId: payload.transitWarehouseId,
             sourceConsolidationId: consolidation.id,
             lines: {
               create: lines.map((l) => ({
@@ -586,7 +595,7 @@ router.post(
     }
 
     const createdPOs = await prisma.$transaction(async (tx) => {
-      const pos = [];
+      const pos: any[] = [];
       for (const [vendorId, lines] of byVendor) {
         const poLines = lines.map((line) => ({
           tenantId,
@@ -850,7 +859,7 @@ router.post(
       const grnClearing = await resolveCoaByCode(tx, tenantId, companyId, "GRN-CLEARING");
 
       for (const line of linesWithDetail) {
-        if (line.acceptedQty <= 0) continue;
+        if (Number(line.acceptedQty) <= 0) continue;
         const unitCost = line.unitCost && Number(line.unitCost) > 0
           ? Number(line.unitCost)
           : line.poLine

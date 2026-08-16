@@ -551,7 +551,7 @@ router.post(
     });
     const payload = schema.parse(req.body);
 
-    const linesWithSnapshot = [];
+    const linesWithSnapshot: Array<z.infer<typeof adjustmentLineSchema> & { systemQty: number; adjustQty: number }> = [];
     for (const l of payload.lines) {
       const balance = await prisma.stockBalance.aggregate({
         where: { tenantId, itemId: l.itemId, warehouseId: payload.warehouseId, ...(l.batchNo ? { batchNo: l.batchNo } : {}) },
@@ -909,7 +909,7 @@ router.get(
     const qtyByItem = new Map<string, number>();
     for (const b of balances) qtyByItem.set(b.itemId, (qtyByItem.get(b.itemId) ?? 0) + Number(b.quantity));
 
-    const alerts = [];
+    const alerts: any[] = [];
     for (const item of items) {
       const threshold = item.reorderLevel !== null ? Number(item.reorderLevel) : item.minStock !== null ? Number(item.minStock) : null;
       if (threshold === null) continue;
