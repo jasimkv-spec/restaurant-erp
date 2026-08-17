@@ -70,6 +70,8 @@ model Tenant {
   // --- Masters ---
   areas             Area[]
   taxes             Tax[]
+  taxGroups         TaxGroup[]
+  taxGroupItems     TaxGroupItem[]
   uoms              Uom[]
   uomConversions    UomConversion[]
   terms             Term[]
@@ -664,10 +666,48 @@ model Tax {
   posMappings   PosItemMapping[]
   itemsAsDefaultTax Item[]
   salesQuoteLines   SalesQuoteLine[]
+  groupMemberships  TaxGroupItem[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
   @@map("taxes")
+}
+
+/**
+ * A named bundle of taxes that get applied together on a document - e.g.
+ * a "Tourism" group combining Tourism Tax + Municipality Tax + VAT, so a
+ * user picks one tax group on an invoice line instead of adding each tax
+ * separately. Membership lives in TaxGroupItem (many-to-many): a tax can
+ * belong to more than one group, and a group can hold any number of taxes.
+ */
+model TaxGroup {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  taxes    TaxGroupItem[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("tax_groups")
+}
+
+model TaxGroupItem {
+  id         String @id @default(uuid())
+  tenantId   String @map("tenant_id")
+  taxGroupId String @map("tax_group_id")
+  taxId      String @map("tax_id")
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+  taxGroup   TaxGroup @relation(fields: [taxGroupId], references: [id])
+  tax        Tax      @relation(fields: [taxId], references: [id])
+
+  @@unique([taxGroupId, taxId])
+  @@index([tenantId])
+  @@map("tax_group_items")
 }
 
 model Uom {

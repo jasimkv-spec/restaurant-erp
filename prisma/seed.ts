@@ -256,7 +256,7 @@ async function main() {
     "Admin.FinancialPeriod", "Admin.ProfitCentre", "Admin.Warehouse",
     "Finance.AccountGroup", "Finance.BankAccount", "Finance.ChartOfAccount",
     "Inventory.Item", "Inventory.ItemCategory", "Inventory.ItemPrice", "Inventory.ItemVendorMapping",
-    "Masters.Area", "Masters.PaymentMethod", "Masters.Tax", "Masters.Term", "Masters.Uom",
+    "Masters.Area", "Masters.PaymentMethod", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
     "Procurement.Vendor",
     "Sales.Customer", "Sales.PosConnector", "Sales.PosItemMapping", "Sales.SalesChannel",
     "Security.Role",

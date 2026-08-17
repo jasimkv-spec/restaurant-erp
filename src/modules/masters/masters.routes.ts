@@ -4,6 +4,7 @@ import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { requirePermission } from "../../middleware/rbac";
+import { ApiError } from "../../utils/errors";
 
 const router = Router();
 
@@ -117,6 +118,61 @@ router.use(
       taxType: z.string().default("VAT"),
       taxGroup: z.enum(["Standard rate", "Zero rated", "Exempt"]).default("Standard rate"),
     }),
+  })
+);
+
+// --- Tax Groups -------------------------------------------------------
+// A bundle of taxes applied together on a document (e.g. Tourism Tax +
+// Municipality Tax + VAT under one "Tourism" group) - not to be confused
+// with Tax.taxGroup, which is an unrelated VAT-return classification
+// (Standard rate / Zero rated / Exempt) on the individual tax record.
+router.use(
+  "/tax-groups",
+  crudRouter(prisma.taxGroup, {
+    permissionKey: "Masters.TaxGroup",
+    createSchema: z.object({
+      code: z.string().min(1).max(20),
+      name: z.string().min(1),
+    }),
+    include: { taxes: { include: { tax: true } } },
+  })
+);
+
+router.post(
+  "/tax-groups/:id/taxes",
+  requirePermission("Masters.TaxGroup.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ taxId: z.string().uuid() });
+    const { taxId } = schema.parse(req.body);
+
+    const group = await prisma.taxGroup.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!group) throw ApiError.notFound();
+    const tax = await prisma.tax.findFirst({ where: { id: taxId, tenantId } });
+    if (!tax) throw ApiError.badRequest("taxId not found");
+
+    const existing = await prisma.taxGroupItem.findFirst({ where: { tenantId, taxGroupId: group.id, taxId } });
+    if (existing) throw ApiError.badRequest("This tax is already in the group");
+
+    const record = await prisma.taxGroupItem.create({
+      data: { tenantId, taxGroupId: group.id, taxId },
+      include: { tax: true },
+    });
+    res.status(201).json(record);
+  })
+);
+
+router.delete(
+  "/tax-groups/:id/taxes/:taxId",
+  requirePermission("Masters.TaxGroup.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const item = await prisma.taxGroupItem.findFirst({
+      where: { tenantId, taxGroupId: req.params.id, taxId: req.params.taxId },
+    });
+    if (!item) throw ApiError.notFound();
+    await prisma.taxGroupItem.delete({ where: { id: item.id } });
+    res.status(204).send();
   })
 );
 
