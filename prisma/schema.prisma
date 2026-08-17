@@ -673,13 +673,11 @@ model Tax {
   @@map("taxes")
 }
 
-/**
- * A named bundle of taxes that get applied together on a document - e.g.
- * a "Tourism" group combining Tourism Tax + Municipality Tax + VAT, so a
- * user picks one tax group on an invoice line instead of adding each tax
- * separately. Membership lives in TaxGroupItem (many-to-many): a tax can
- * belong to more than one group, and a group can hold any number of taxes.
- */
+// A named bundle of taxes that get applied together on a document - e.g.
+// a "Tourism" group combining Tourism Tax + Municipality Tax + VAT, so a
+// user picks one tax group on an invoice line instead of adding each tax
+// separately. Membership lives in TaxGroupItem (many-to-many): a tax can
+// belong to more than one group, and a group can hold any number of taxes.
 model TaxGroup {
   id       String @id @default(uuid())
   tenantId String @map("tenant_id")
