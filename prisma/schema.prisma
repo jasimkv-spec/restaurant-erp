@@ -238,6 +238,11 @@ model Company {
   updatedAt      DateTime @updatedAt @map("updated_at")
 
   tenant           Tenant             @relation(fields: [tenantId], references: [id])
+  // The currency financial statements and postings for this company are
+  // recorded in. Transactions may be entered in a vendor/customer's own
+  // currency, but always get converted to this one for the ledger - see
+  // Currency.exchangeRate.
+  baseCurrency     Currency?          @relation(fields: [baseCurrencyId], references: [id])
   branches         Branch[]
   costCentres      CostCentre[]
   profitCentres    ProfitCentre[]
@@ -639,12 +644,23 @@ model Area {
 }
 
 model Currency {
-  id               String @id @default(uuid())
-  code             String @unique // ISO 4217, e.g. AED, USD
+  id               String  @id @default(uuid())
+  code             String  @unique // ISO 4217, e.g. AED, USD
   name             String
-  decimalPrecision Int    @default(2) @map("decimal_precision")
+  decimalPrecision Int     @default(2) @map("decimal_precision")
+  // How many units of a company's base currency equal 1 unit of this
+  // currency (e.g. if AED is the base currency and 1 USD = 3.6725 AED,
+  // this is 3.6725 on the USD row). A currency set as a company's own
+  // base currency should be left at the default of 1. Editable any time
+  // from the Currencies screen; each transaction captures the rate that
+  // was in effect when it was entered, so changing this later does not
+  // rewrite historical transactions - see the transaction modules for
+  // where that rate gets frozen in.
+  exchangeRate     Decimal @default(1) @db.Decimal(18, 6) @map("exchange_rate")
 
-  vendors Vendor[]
+  vendors   Vendor[]
+  customers Customer[]
+  companies Company[]
 
   @@map("currencies")
 }
@@ -1964,6 +1980,10 @@ model Customer {
   dateOfBirth            DateTime? @map("date_of_birth")
   receivableGlId         String?  @map("receivable_gl_id")
   creditLimit            Decimal? @db.Decimal(18, 3) @map("credit_limit")
+  // Currency this customer transacts in - sales documents default to this
+  // and convert to the company's base currency for the ledger, mirroring
+  // Vendor.currencyId.
+  currencyId             String?  @map("currency_id")
   notes                  String?
   status                 String   @default("Active")
 
@@ -1972,6 +1992,7 @@ model Customer {
   city           City?    @relation(fields: [cityId], references: [id])
   area           Area?    @relation(fields: [areaId], references: [id])
   paymentTerms   Term?    @relation(fields: [paymentTermsId], references: [id])
+  currency       Currency? @relation(fields: [currencyId], references: [id])
   salesInvoices  SalesInvoice[]
   salesQuotes    SalesQuote[]
   deliveryOrders DeliveryOrder[]

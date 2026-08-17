@@ -49,7 +49,7 @@ router.use(
       payableGlId: z.string().uuid().optional(),
       notes: z.string().optional(),
     }),
-    include: { country: true, city: true, area: true, paymentTerms: true },
+    include: { country: true, city: true, area: true, paymentTerms: true, currency: true },
     sensitiveFields: { fields: ["bankName", "bankAccountNo", "iban"], requiredPermission: "Procurement.Vendor.ViewBankDetails" },
   })
 );

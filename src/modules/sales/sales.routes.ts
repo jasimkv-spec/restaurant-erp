@@ -34,9 +34,10 @@ router.use(
       dateOfBirth: z.coerce.date().optional(),
       receivableGlId: z.string().uuid().optional(),
       creditLimit: z.number().nonnegative().optional(),
+      currencyId: z.string().uuid().optional(),
       notes: z.string().optional(),
     }),
-    include: { country: true, city: true, area: true, paymentTerms: true },
+    include: { country: true, city: true, area: true, paymentTerms: true, currency: true },
   })
 );
 

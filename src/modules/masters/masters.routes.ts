@@ -99,10 +99,35 @@ router.post(
       code: z.string().length(3),
       name: z.string().min(1),
       decimalPrecision: z.number().int().min(0).max(6).default(2),
+      // Units of a company's base currency per 1 unit of this currency.
+      // Leave at 1 for whichever currency is set as the company's own
+      // base currency.
+      exchangeRate: z.number().positive().default(1),
     });
     const payload = schema.parse(req.body);
     const record = await prisma.currency.create({ data: payload });
     res.status(201).json(record);
+  })
+);
+
+// Currencies are shared/global (no tenantId), but unlike the other
+// platform-global lookups (Countries, Banks) the exchange rate genuinely
+// needs to be editable over time as real-world rates move - so this one
+// gets a PUT even though it has no crudRouter behind it.
+router.put(
+  "/currencies/:id",
+  requirePermission("Masters.Currency.Edit"),
+  asyncHandler(async (req, res) => {
+    const schema = z.object({
+      name: z.string().min(1).optional(),
+      decimalPrecision: z.number().int().min(0).max(6).optional(),
+      exchangeRate: z.number().positive().optional(),
+    });
+    const payload = schema.parse(req.body);
+    const existing = await prisma.currency.findUnique({ where: { id: req.params.id } });
+    if (!existing) throw ApiError.notFound();
+    const record = await prisma.currency.update({ where: { id: req.params.id }, data: payload });
+    res.json(record);
   })
 );
 

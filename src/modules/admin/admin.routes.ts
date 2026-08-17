@@ -24,6 +24,7 @@ router.use(
       logoUrl: z.string().optional(),
       dateFormat: z.string().default("dd-MM-yyyy"),
     }),
+    include: { baseCurrency: true },
   })
 );
 
