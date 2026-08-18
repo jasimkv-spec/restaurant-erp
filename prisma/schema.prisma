@@ -58,6 +58,7 @@ model Tenant {
   documentSeries    DocumentSeries[]
   masterSeries      MasterSeries[]
   companyPolicies   CompanyPolicy[]
+  policyRules       PolicyRule[]
 
   // --- Security ---
   users                User[]
@@ -253,6 +254,7 @@ model Company {
   bankAccounts     BankAccount[]
   journalEntries   JournalEntry[]
   companyPolicies  CompanyPolicy[]
+  policyRules      PolicyRule[]
   contraVouchers   ContraVoucher[]
 
   @@unique([tenantId, code])
@@ -275,6 +277,7 @@ model Branch {
 
   tenant              Tenant   @relation(fields: [tenantId], references: [id])
   company             Company  @relation(fields: [companyId], references: [id])
+  policyRules         PolicyRule[]
 
   warehouses          Warehouse[]
   materialRequests    MaterialRequest[]
@@ -479,6 +482,42 @@ model CompanyPolicy {
   @@map("company_policies")
 }
 
+/// Superseded by PolicyRule below (a scoped rule table, matching how
+/// mature ERPs actually do this - see the Company Policies screen). Kept
+/// around only so the model/table isn't deleted out from under any old
+/// data; nothing reads or writes it anymore as of the PolicyRule rollout.
+/// A company-wide row in PolicyRule (branch/user/role all null) is the
+/// equivalent of what a CompanyPolicy row used to represent.
+model PolicyRule {
+  id         String   @id @default(uuid())
+  tenantId   String   @map("tenant_id")
+  companyId  String   @map("company_id")
+  // Each scope column is null = "applies to All" (branches/users/roles).
+  // A non-null value narrows the rule to just that branch/user/role. See
+  // src/services/policyRuleService.ts for how the most specific matching
+  // rule is chosen when several could apply to the same request.
+  branchId   String?  @map("branch_id")
+  userId     String?  @map("user_id")
+  roleId     String?  @map("role_id")
+  policyType String   @map("policy_type")
+  // Optional numeric parameter - meaning depends on policyType, e.g. max
+  // days for BackdatedTransaction/PostdatedTransaction, max percent for
+  // DiscountEditing. Null where the policy is a plain allow/disallow.
+  value      Decimal? @db.Decimal(18, 3)
+  allow      Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+  company    Company  @relation(fields: [companyId], references: [id])
+  branch     Branch?  @relation(fields: [branchId], references: [id])
+  user       User?    @relation(fields: [userId], references: [id])
+  role       Role?    @relation(fields: [roleId], references: [id])
+
+  @@index([tenantId, companyId, policyType])
+  @@map("policy_rules")
+}
+
 // ============================================================================
 // 3. SECURITY
 // ============================================================================
@@ -503,6 +542,7 @@ model User {
   approvalTasks     ApprovalTask[]
   notifications     Notification[]
   auditLogs         AuditLog[]
+  policyRules       PolicyRule[]
 
   @@unique([tenantId, email])
   @@index([tenantId])
@@ -519,6 +559,7 @@ model Role {
   tenant           Tenant @relation(fields: [tenantId], references: [id])
   rolePermissions  RolePermission[]
   userRoles        UserRole[]
+  policyRules      PolicyRule[]
 
   @@unique([tenantId, code])
   @@index([tenantId])

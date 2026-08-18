@@ -1,7 +1,7 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 import { assertPeriodOpen } from "./periodService";
 import { writeAuditLog } from "./auditService";
-import { getCompanyPolicy } from "./policyService";
+import { resolvePolicy, assertDateAllowed } from "./policyRuleService";
 import { ApiError } from "../utils/errors";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
@@ -62,8 +62,15 @@ export async function postStockMovement(tx: Tx, input: StockMovementInput) {
   await assertPeriodOpen(tx, {
     tenantId,
     companyId: warehouse.branch.companyId,
+    branchId: warehouse.branchId,
     date: movementDate,
     kind: "Inventory",
+  });
+  await assertDateAllowed(tx, {
+    tenantId,
+    companyId: warehouse.branch.companyId,
+    branchId: warehouse.branchId,
+    date: movementDate,
   });
 
   const balanceKey = {
@@ -81,22 +88,47 @@ export async function postStockMovement(tx: Tx, input: StockMovementInput) {
   const priorValue = existingBalance ? Number(existingBalance.value) : 0;
   const priorAvgCost = priorQty !== 0 ? priorValue / priorQty : 0;
 
-  // Was never enforced anywhere before - defaults to true (today's actual
-  // behaviour: nothing blocks it) so turning this on is an explicit,
-  // opt-in choice from the Company Policies screen rather than a silent
-  // behaviour change for tenants who haven't touched that setting.
+  // Was never enforced anywhere before - defaults to allow=true (today's
+  // actual behaviour: nothing blocks it) so turning this on is an
+  // explicit, opt-in choice from the Company Policies screen rather than
+  // a silent behaviour change for tenants who haven't touched it.
   if (qtyOut > 0) {
-    const allowNegativeStock = await getCompanyPolicy(tx, {
+    const negativeStockPolicy = await resolvePolicy(tx, {
       tenantId,
       companyId: warehouse.branch.companyId,
-      policyKey: "allowNegativeStock",
-      defaultValue: true,
+      branchId: warehouse.branchId,
+      policyType: "AllowNegativeStock",
+      defaultAllow: true,
+      defaultValue: null,
     });
-    if (!allowNegativeStock && priorQty - qtyOut < 0) {
+    if (!negativeStockPolicy.allow && priorQty - qtyOut < 0) {
       throw ApiError.badRequest(
         `This would take stock negative (have ${priorQty}, moving out ${qtyOut}) and this company's policy disallows negative stock.`,
         { priorQty, qtyOut }
       );
+    }
+
+    // Separate from going negative - an item can have a configured
+    // reorderLevel/minStock (Inventory > Items) that's still above zero;
+    // this optionally blocks a movement that would cross that line even
+    // while stock stays positive.
+    const minStockPolicy = await resolvePolicy(tx, {
+      tenantId,
+      companyId: warehouse.branch.companyId,
+      branchId: warehouse.branchId,
+      policyType: "MinStockLevelCross",
+      defaultAllow: true,
+      defaultValue: null,
+    });
+    if (!minStockPolicy.allow) {
+      const item = await tx.item.findUnique({ where: { id: itemId }, select: { reorderLevel: true, minStock: true } });
+      const floor = item?.minStock ?? item?.reorderLevel ?? null;
+      if (floor !== null && priorQty - qtyOut < Number(floor)) {
+        throw ApiError.badRequest(
+          `This would take stock (${(priorQty - qtyOut).toFixed(2)}) below its configured minimum level (${Number(floor)}) and this company's policy disallows that.`,
+          { priorQty, qtyOut, minLevel: Number(floor) }
+        );
+      }
     }
   }
 

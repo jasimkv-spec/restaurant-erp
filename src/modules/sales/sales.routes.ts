@@ -9,6 +9,7 @@ import { postJournal, recordPostingException } from "../../services/journalServi
 import { resolveCoaByCode } from "../../services/coaLookup";
 import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
+import { assertPricingAllowed, assertDateAllowed } from "../../services/policyRuleService";
 
 const router = Router();
 
@@ -69,9 +70,17 @@ router.post(
     const payload = schema.parse(req.body);
 
     const record = await prisma.$transaction(async (tx) => {
+      const companyId = (await tx.branch.findUniqueOrThrow({ where: { id: payload.branchId } })).companyId;
+      await assertPricingAllowed(tx, {
+        tenantId,
+        companyId,
+        branchId: payload.branchId,
+        userId: req.user?.userId,
+        lines: payload.lines.map((l) => ({ itemId: l.itemId, unitPrice: l.unitPrice })),
+      });
       const quoteNo = await nextDocumentNumber(tx, {
         tenantId,
-        companyId: (await tx.branch.findUniqueOrThrow({ where: { id: payload.branchId } })).companyId,
+        companyId,
         moduleCode: "SalesQuote",
         defaultPrefix: "QTN",
       });
@@ -289,6 +298,14 @@ router.post(
 
     const created: unknown[] = [];
     const exceptions: { invoiceNo: string; reason: string }[] = [];
+    const branchCompanyId = (await prisma.branch.findUniqueOrThrow({ where: { id: payload.branchId } })).companyId;
+    await assertDateAllowed(prisma, {
+      tenantId,
+      companyId: branchCompanyId,
+      branchId: payload.branchId,
+      userId: req.user?.userId,
+      date: payload.businessDate,
+    });
 
     for (const inv of payload.invoices) {
       const duplicate = await prisma.salesInvoice.findFirst({
@@ -331,6 +348,22 @@ router.post(
 
       if (lineException) {
         exceptions.push({ invoiceNo: inv.invoiceNo, reason: lineException });
+        continue;
+      }
+
+      // Consistent with the rest of this batch: a policy violation routes
+      // this one invoice to the exception queue instead of failing the
+      // whole import.
+      try {
+        await assertPricingAllowed(prisma, {
+          tenantId,
+          companyId: branchCompanyId,
+          branchId: payload.branchId,
+          lines: resolvedLines.map((l) => ({ itemId: l.itemId, unitPrice: l.unitPrice })),
+          discountPct: inv.gross > 0 ? (inv.discount / inv.gross) * 100 : 0,
+        });
+      } catch (err) {
+        exceptions.push({ invoiceNo: inv.invoiceNo, reason: err instanceof ApiError ? err.message : "Policy check failed" });
         continue;
       }
 

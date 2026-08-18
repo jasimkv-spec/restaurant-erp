@@ -11,7 +11,7 @@ import { postJournal, recordPostingException } from "../../services/journalServi
 import { resolveCoaByCode } from "../../services/coaLookup";
 import { triggerApproval } from "../../services/approvalService";
 import { writeAuditLog } from "../../services/auditService";
-import { getCompanyPolicy } from "../../services/policyService";
+import { resolvePolicy } from "../../services/policyRuleService";
 
 const router = Router();
 
@@ -1255,12 +1255,15 @@ router.post(
     // Was a hardcoded 2% constant - now reads the company's own tolerance
     // from the Company Policies screen (falls back to the same 2% if the
     // admin hasn't set one, so existing behaviour doesn't change silently).
-    const tolerancePct = await getCompanyPolicy(prisma, {
+    // Value is stored as a plain percentage (2 = 2%), not a fraction.
+    const tolerancePolicy = await resolvePolicy(prisma, {
       tenantId,
       companyId,
-      policyKey: "poGrnInvoiceTolerancePct",
-      defaultValue: 0.02,
+      policyType: "PoGrnInvoiceTolerancePct",
+      defaultAllow: true,
+      defaultValue: 2,
     });
+    const tolerancePct = (tolerancePolicy.value ?? 2) / 100;
 
     const variance = expectedAmount === 0 ? 0 : Math.abs(Number(invoice.gross) - expectedAmount) / expectedAmount;
     if (variance > tolerancePct) {
@@ -1268,6 +1271,34 @@ router.post(
         `Invoice amount ${invoice.gross} exceeds tolerance vs matched GRN value ${expectedAmount.toFixed(2)} (variance ${(variance * 100).toFixed(1)}%)`,
         { expectedAmount, invoiceGross: invoice.gross, tolerancePct }
       );
+    }
+
+    // Was never enforced anywhere before - defaults to allow=true so
+    // nothing changes for a company until it's explicitly restricted from
+    // the Company Policies screen.
+    const vendorCreditPolicy = await resolvePolicy(prisma, {
+      tenantId,
+      companyId,
+      policyType: "PurchaseAboveVendorCreditLimit",
+      defaultAllow: true,
+      defaultValue: null,
+    });
+    if (!vendorCreditPolicy.allow && invoice.vendor.creditLimit) {
+      const postedInvoices = await prisma.purchaseInvoice.findMany({
+        where: { tenantId, vendorId: invoice.vendorId, postingStatus: "Posted" },
+        include: { payments: true },
+      });
+      const currentOutstanding = postedInvoices.reduce((sum, inv) => {
+        const applied = inv.payments.reduce((s, p) => s + Number(p.appliedAmount), 0);
+        return sum + (Number(inv.net) - applied);
+      }, 0);
+      const projected = currentOutstanding + Number(invoice.net);
+      if (projected > Number(invoice.vendor.creditLimit)) {
+        throw ApiError.badRequest(
+          `Posting this invoice would put ${invoice.vendor.name}'s outstanding balance at ${projected.toFixed(2)}, above their credit limit of ${Number(invoice.vendor.creditLimit).toFixed(2)}.`,
+          { projected, creditLimit: Number(invoice.vendor.creditLimit) }
+        );
+      }
     }
 
     await prisma.$transaction(async (tx) => {

@@ -1,6 +1,7 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 import { assertPeriodOpen } from "./periodService";
 import { writeAuditLog } from "./auditService";
+import { assertDateAllowed } from "./policyRuleService";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -50,8 +51,15 @@ export async function postJournal(tx: Tx, input: PostJournalInput) {
   await assertPeriodOpen(tx, {
     tenantId: input.tenantId,
     companyId: input.companyId,
+    userId: input.postedBy,
     date: journalDate,
     kind: "Finance",
+  });
+  await assertDateAllowed(tx, {
+    tenantId: input.tenantId,
+    companyId: input.companyId,
+    userId: input.postedBy,
+    date: journalDate,
   });
 
   const journal = await tx.journalEntry.create({

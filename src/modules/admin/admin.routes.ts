@@ -4,6 +4,7 @@ import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { requirePermission } from "../../middleware/rbac";
+import { ApiError } from "../../utils/errors";
 
 const router = Router();
 
@@ -166,38 +167,61 @@ router.use(
   })
 );
 
-// --- Company Policies (generic on/off + config switches, BRD 5.1) ---------
+// --- Company Policies (scoped rule table, BRD 5.1) -------------------------
+// A policyType can have several rules, each narrowed to a branch/user/role
+// (null = "All") - see src/services/policyRuleService.ts for how the most
+// specific matching rule gets picked at check time. Plain list/create/
+// delete rather than crudRouter: these rows are simple config, not
+// audit-critical transactional data, so a hard delete (not
+// activate/deactivate) is the right fit.
 router.get(
-  "/company-policies/:companyId",
+  "/policy-rules",
   requirePermission("Admin.CompanyPolicy.View"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const items = await prisma.companyPolicy.findMany({
-      where: { tenantId, companyId: req.params.companyId },
+    const where: Record<string, unknown> = { tenantId };
+    if (req.query.companyId) where.companyId = req.query.companyId;
+    const items = await prisma.policyRule.findMany({
+      where,
+      include: { branch: true, user: true, role: true },
+      orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
   })
 );
 
-router.put(
-  "/company-policies/:companyId/:policyKey",
+router.post(
+  "/policy-rules",
   requirePermission("Admin.CompanyPolicy.Edit"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({ value: z.any() });
-    const { value } = schema.parse(req.body);
-    const record = await prisma.companyPolicy.upsert({
-      where: {
-        tenantId_companyId_policyKey: {
-          tenantId,
-          companyId: req.params.companyId,
-          policyKey: req.params.policyKey,
-        },
-      },
-      update: { policyValue: value },
-      create: { tenantId, companyId: req.params.companyId, policyKey: req.params.policyKey, policyValue: value },
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      branchId: z.string().uuid().optional(),
+      userId: z.string().uuid().optional(),
+      roleId: z.string().uuid().optional(),
+      policyType: z.string().min(1),
+      value: z.number().optional(),
+      allow: z.boolean().default(true),
     });
-    res.json(record);
+    const payload = schema.parse(req.body);
+    const record = await prisma.policyRule.create({
+      data: { ...payload, tenantId },
+      include: { branch: true, user: true, role: true },
+    });
+    res.status(201).json(record);
+  })
+);
+
+router.delete(
+  "/policy-rules/:id",
+  requirePermission("Admin.CompanyPolicy.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.policyRule.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    await prisma.policyRule.delete({ where: { id: existing.id } });
+    res.status(204).send();
   })
 );
 
