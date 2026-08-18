@@ -2720,6 +2720,15 @@ model DocumentAttachment {
   recordId       String    @map("record_id")
   documentTypeId String    @map("document_type_id")
   fileRef        String    @map("file_ref")
+  // Actual uploaded file, stored as bytes directly in Postgres rather than
+  // on local disk - Render's free-tier disk is ephemeral (wiped on every
+  // deploy/restart), so local files would vanish. fileRef above is kept for
+  // backward compatibility with any pre-upload rows; fileName/mimeType are
+  // optional so old rows without a real upload don't need a migration
+  // backfill.
+  fileName       String?   @map("file_name")
+  mimeType       String?   @map("mime_type")
+  fileData       Bytes?    @map("file_data")
   issueDate      DateTime? @map("issue_date")
   expiryDate     DateTime? @map("expiry_date")
   status         String    @default("Active")

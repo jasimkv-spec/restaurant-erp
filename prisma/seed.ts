@@ -320,7 +320,7 @@ async function main() {
     "Security.RolePermission.Edit", "Security.RolePermission.View", "Security.UserRole.Edit",
     "Security.Users.Create", "Security.Users.Edit", "Security.Users.View", "Security.WarehouseAccess.Edit",
     "Workflow.ApprovalTask.Approve", "Workflow.ApprovalTask.View",
-    "Workflow.DocumentAttachment.Create", "Workflow.DocumentAttachment.View",
+    "Workflow.DocumentAttachment.Create", "Workflow.DocumentAttachment.Edit", "Workflow.DocumentAttachment.View",
     "Workflow.Notification.Edit", "Workflow.Notification.View",
   ];
   const allPermissionKeys = [
@@ -430,6 +430,31 @@ async function main() {
         conditionJson: { minAmount: 5000 },
         approvalLevelsJson: [{ level: 1, approverRoleCode: "FinanceManager" }],
       },
+    });
+  }
+
+  // --- Document Types (for the Vendor/Customer attachments panel) ---------
+  // moduleCode here matches the same "Module.Screen" namespace as
+  // permission keys - the frontend passes this same string as the
+  // moduleCode query param when listing/uploading attachments for that
+  // master, and the Document Types admin screen groups rows by it. Employee
+  // and transaction-level document types (per the user's own forward-
+  // looking note) get added the same way later, no schema change needed.
+  const documentTypeSeed: { moduleCode: string; name: string; expiryRequired?: boolean; mandatory?: boolean }[] = [
+    { moduleCode: "Procurement.Vendor", name: "Trade License", expiryRequired: true, mandatory: true },
+    { moduleCode: "Procurement.Vendor", name: "VAT Certificate", expiryRequired: true },
+    { moduleCode: "Procurement.Vendor", name: "Bank Details Letter" },
+    { moduleCode: "Procurement.Vendor", name: "Other" },
+    { moduleCode: "Sales.Customer", name: "Trade License", expiryRequired: true },
+    { moduleCode: "Sales.Customer", name: "VAT Certificate", expiryRequired: true },
+    { moduleCode: "Sales.Customer", name: "Credit Agreement" },
+    { moduleCode: "Sales.Customer", name: "Other" },
+  ];
+  for (const dt of documentTypeSeed) {
+    await prisma.documentType.upsert({
+      where: { tenantId_moduleCode_name: { tenantId: tenant.id, moduleCode: dt.moduleCode, name: dt.name } },
+      update: {},
+      create: { tenantId: tenant.id, ...dt },
     });
   }
 
