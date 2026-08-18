@@ -4,8 +4,8 @@ import { formatDocumentNumber } from "./documentNumber";
 type Tx = PrismaClient | Prisma.TransactionClient;
 
 /**
- * Auto-generates codes for master-data records (Vendors, Customers, and
- * later Employees) the same way nextDocumentNumber() generates transaction
+ * Resolves the code for a master-data record (Vendors, Customers, and
+ * later Employees) the same way nextDocumentNumber() resolves transaction
  * numbers - e.g. entityType="Vendor" with prefix "SUP" and digitLength 4
  * produces "SUP0001", "SUP0002", etc.
  *
@@ -15,21 +15,28 @@ type Tx = PrismaClient | Prisma.TransactionClient;
  * tenant-wide - a vendor or customer code should not repeat just because
  * they were first entered against a different company.
  *
+ * A manually-typed code always wins, regardless of the series' mode. When
+ * nothing was typed: Auto mode fills in the next number; Manual mode
+ * returns undefined and leaves the field blank, so the normal "code is
+ * required" validation on the create schema catches it with a clear error
+ * instead of silently falling back to auto-numbering.
+ *
  * Called from crudFactory's create handler via CrudOptions.autoCode - see
- * src/utils/crudFactory.ts. Only fills the code in when the caller left
- * the field blank, so manual codes still work if someone wants full
- * control instead of the auto-series.
+ * src/utils/crudFactory.ts.
  */
-export async function nextMasterNumber(
+export async function resolveMasterCode(
   tx: Tx,
-  params: { tenantId: string; entityType: string; defaultPrefix: string }
-): Promise<string> {
-  const { tenantId, entityType, defaultPrefix } = params;
-  const now = new Date();
+  params: { tenantId: string; entityType: string; defaultPrefix: string; providedValue?: string }
+): Promise<string | undefined> {
+  const { tenantId, entityType, defaultPrefix, providedValue } = params;
+  if (providedValue) return providedValue;
 
+  const now = new Date();
   const series = await tx.masterSeries.findFirst({ where: { tenantId, entityType } });
 
   if (!series) {
+    // No series configured yet - Auto is the default, so create one and
+    // hand back the first number.
     await tx.masterSeries.create({
       data: { tenantId, entityType, prefix: defaultPrefix, nextNo: 2 },
     });
@@ -48,6 +55,8 @@ export async function nextMasterNumber(
       now
     );
   }
+
+  if (series.numberingMode === "Manual") return undefined;
 
   const current = series.nextNo;
   await tx.masterSeries.update({ where: { id: series.id }, data: { nextNo: current + 1 } });

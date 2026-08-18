@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient } from "@prisma/client";
+import { ApiError } from "./errors";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -37,8 +38,17 @@ export function formatDocumentNumber(series: SeriesFormat, serialValue: number, 
  * numbering"). Creates a default series (prefix = moduleCode, 6-digit
  * zero-padded serial, no year/month segment) on first use so the MVP works
  * without manual setup. Admins can reconfigure digit length, padding
- * character, separator, and year/month segments per series via
+ * character, separator, year/month segments, and Auto/Manual mode via
  * PUT /api/admin/document-series/:id.
+ *
+ * When a series is set to Manual, the caller must pass manualValue (the
+ * number the user typed in on that transaction screen) - if it's missing,
+ * this throws rather than silently falling back to auto-numbering, so a
+ * misconfigured series fails loudly instead of quietly ignoring the
+ * admin's setting. As of this change, none of the transaction screens
+ * actually collect and pass a manual value yet (those screens don't have
+ * frontend UI built), so switching a series to Manual will correctly block
+ * that document type until its screen is updated to support it.
  *
  * Note: resetPolicy (Never/Yearly/Monthly) is stored but not yet enforced
  * here - nextNo always increments. Wiring the actual reset (comparing the
@@ -53,11 +63,14 @@ export async function nextDocumentNumber(
     branchId?: string | null;
     moduleCode: string;
     defaultPrefix?: string;
+    manualValue?: string;
   }
 ): Promise<string> {
-  const { tenantId, companyId, branchId = null, moduleCode } = params;
+  const { tenantId, companyId, branchId = null, moduleCode, manualValue } = params;
   const defaultPrefix = params.defaultPrefix ?? moduleCode.slice(0, 3).toUpperCase();
   const now = new Date();
+
+  if (manualValue) return manualValue;
 
   const series = await tx.documentSeries.findFirst({
     where: { tenantId, companyId, branchId, moduleCode },
@@ -71,6 +84,12 @@ export async function nextDocumentNumber(
       { prefix: defaultPrefix, nextNo: 1, digitLength: 6, padChar: "0", separator: "-", includeYear: false, yearFormat: "YYYY", includeMonth: false },
       1,
       now
+    );
+  }
+
+  if (series.numberingMode === "Manual") {
+    throw ApiError.badRequest(
+      `${moduleCode} numbering is set to Manual in Document Series, but this screen doesn't collect a manual number yet - set it back to Auto, or ask for manual entry to be added here.`
     );
   }
 

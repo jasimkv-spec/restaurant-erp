@@ -5,7 +5,7 @@ import { asyncHandler } from "./asyncHandler";
 import { ApiError } from "./errors";
 import { requirePermission, hasPermission } from "../middleware/rbac";
 import { writeAuditLog } from "../services/auditService";
-import { nextMasterNumber } from "./masterNumber";
+import { resolveMasterCode } from "./masterNumber";
 
 /**
  * Generic tenant-scoped CRUD router factory, used for straightforward
@@ -144,12 +144,14 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
     asyncHandler(async (req, res) => {
       const tenantId = req.tenant!.id;
       const rawBody: Record<string, unknown> = { ...req.body };
-      if (opts.autoCode && !rawBody[opts.autoCode.field]) {
-        rawBody[opts.autoCode.field] = await nextMasterNumber(prisma, {
+      if (opts.autoCode) {
+        const resolved = await resolveMasterCode(prisma, {
           tenantId,
           entityType: opts.autoCode.entityType,
           defaultPrefix: opts.autoCode.defaultPrefix,
+          providedValue: rawBody[opts.autoCode.field] as string | undefined,
         });
+        if (resolved !== undefined) rawBody[opts.autoCode.field] = resolved;
       }
       const payload = opts.createSchema.parse(rawBody);
       const record = await delegate.create({ data: { ...payload, tenantId } });

@@ -407,6 +407,11 @@ model DocumentSeries {
   moduleCode   String   @map("module_code")
   prefix       String
   nextNo       Int      @default(1) @map("next_no")
+  // Auto = system generates the number (as today). Manual = the user
+  // types their own number in on the transaction screen - see
+  // nextDocumentNumber() in src/utils/documentNumber.ts for how this is
+  // enforced (and its current limits).
+  numberingMode String  @default("Auto") @map("numbering_mode") // Auto|Manual
   resetPolicy  String   @default("Never") @map("reset_policy") // Never|Yearly|Monthly
   digitLength  Int      @default(6) @map("digit_length") // how many digits the serial pads out to, e.g. 6 -> 000012
   padChar      String   @default("0") @map("pad_char")
@@ -434,6 +439,10 @@ model MasterSeries {
   entityType   String  @map("entity_type") // "Vendor" | "Customer" | "Employee"
   prefix       String
   nextNo       Int     @default(1) @map("next_no")
+  // Auto = system generates the code (as today). Manual = the code field
+  // is left blank for the user to type their own - see resolveMasterCode()
+  // in src/utils/masterNumber.ts.
+  numberingMode String @default("Auto") @map("numbering_mode") // Auto|Manual
   digitLength  Int     @default(4) @map("digit_length")
   padChar      String  @default("0") @map("pad_char")
   separator    String  @default("") @map("separator")
