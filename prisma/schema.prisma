@@ -56,6 +56,7 @@ model Tenant {
   profitCentres     ProfitCentre[]
   financialPeriods  FinancialPeriod[]
   documentSeries    DocumentSeries[]
+  masterSeries      MasterSeries[]
   companyPolicies   CompanyPolicy[]
 
   // --- Security ---
@@ -420,6 +421,31 @@ model DocumentSeries {
   @@unique([tenantId, companyId, branchId, moduleCode])
   @@index([tenantId])
   @@map("document_series")
+}
+
+// Auto-numbering for master-data codes (Vendor, Customer, and later
+// Employee) - e.g. entityType "Vendor" with prefix "SUP" produces
+// SUP0001, SUP0002, ... Tenant-wide rather than per-company like
+// DocumentSeries, since a vendor/customer code should stay the same
+// regardless of which company first created the record.
+model MasterSeries {
+  id           String  @id @default(uuid())
+  tenantId     String  @map("tenant_id")
+  entityType   String  @map("entity_type") // "Vendor" | "Customer" | "Employee"
+  prefix       String
+  nextNo       Int     @default(1) @map("next_no")
+  digitLength  Int     @default(4) @map("digit_length")
+  padChar      String  @default("0") @map("pad_char")
+  separator    String  @default("") @map("separator")
+  includeYear  Boolean @default(false) @map("include_year")
+  yearFormat   String  @default("YYYY") @map("year_format")
+  includeMonth Boolean @default(false) @map("include_month")
+
+  tenant       Tenant  @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, entityType])
+  @@index([tenantId])
+  @@map("master_series")
 }
 
 /// Generic on/off + config switches referenced in BRD 5.1 ("Company

@@ -2,7 +2,7 @@ import { Prisma, PrismaClient } from "@prisma/client";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
-interface SeriesFormat {
+export interface SeriesFormat {
   prefix: string;
   nextNo: number;
   digitLength: number;
@@ -14,8 +14,10 @@ interface SeriesFormat {
 }
 
 /** Builds the human-readable number for a series, e.g. "PO-2026-08-000012"
- * for prefix=PO, includeYear+includeMonth on, digitLength=6, padChar="0". */
-function formatDocumentNumber(series: SeriesFormat, serialValue: number, now: Date): string {
+ * for prefix=PO, includeYear+includeMonth on, digitLength=6, padChar="0".
+ * Exported so master-data code numbering (src/utils/masterNumber.ts) can
+ * reuse the exact same formatting rules instead of re-implementing them. */
+export function formatDocumentNumber(series: SeriesFormat, serialValue: number, now: Date): string {
   const parts = [series.prefix];
   if (series.includeYear) {
     const year = now.getUTCFullYear();

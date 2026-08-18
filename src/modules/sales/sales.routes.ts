@@ -38,6 +38,7 @@ router.use(
       notes: z.string().optional(),
     }),
     include: { country: true, city: true, area: true, paymentTerms: true, currency: true },
+    autoCode: { field: "code", entityType: "Customer", defaultPrefix: "CUS" },
   })
 );
 

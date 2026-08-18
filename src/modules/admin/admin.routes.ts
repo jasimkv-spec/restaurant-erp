@@ -140,6 +140,30 @@ router.use(
   })
 );
 
+// --- Master Series (auto-prefix codes for Vendors, Customers, etc.) -------
+// Tenant-wide (no companyId), unlike Document Series - see
+// src/utils/masterNumber.ts for why. entityType is a free-form string so
+// new master types (e.g. "Employee") can start using this without a
+// schema change - just pass a new entityType from that module's route.
+router.use(
+  "/master-series",
+  crudRouter(prisma.masterSeries, {
+    permissionKey: "Admin.MasterSeries",
+    createSchema: z.object({
+      entityType: z.string().min(1).max(30),
+      prefix: z.string().min(1).max(10),
+      nextNo: z.number().int().positive().default(1),
+      digitLength: z.number().int().min(1).max(12).default(4),
+      padChar: z.string().length(1).default("0"),
+      separator: z.string().max(3).default(""),
+      includeYear: z.boolean().default(false),
+      yearFormat: z.enum(["YYYY", "YY"]).default("YYYY"),
+      includeMonth: z.boolean().default(false),
+    }),
+    statusField: "prefix", // no real status column; activate/deactivate unused
+  })
+);
+
 // --- Company Policies (generic on/off + config switches, BRD 5.1) ---------
 router.get(
   "/company-policies/:companyId",

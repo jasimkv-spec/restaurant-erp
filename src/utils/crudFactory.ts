@@ -5,6 +5,7 @@ import { asyncHandler } from "./asyncHandler";
 import { ApiError } from "./errors";
 import { requirePermission, hasPermission } from "../middleware/rbac";
 import { writeAuditLog } from "../services/auditService";
+import { nextMasterNumber } from "./masterNumber";
 
 /**
  * Generic tenant-scoped CRUD router factory, used for straightforward
@@ -57,6 +58,13 @@ export interface CrudOptions {
    * see it later).
    */
   sensitiveFields?: { fields: string[]; requiredPermission: string };
+  /**
+   * Auto-fills a field from a MasterSeries (src/utils/masterNumber.ts) on
+   * create when the caller left it blank - e.g. Vendor "code" becoming
+   * "SUP0001". A manually-supplied value always wins, so this only kicks
+   * in when the field is missing/empty.
+   */
+  autoCode?: { field: string; entityType: string; defaultPrefix: string };
 }
 
 function maskSensitive<T extends Record<string, any>>(record: T, opts: CrudOptions, req: { user?: any }): T {
@@ -135,7 +143,15 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
     requirePermission(`${opts.permissionKey}.Create`),
     asyncHandler(async (req, res) => {
       const tenantId = req.tenant!.id;
-      const payload = opts.createSchema.parse(req.body);
+      const rawBody: Record<string, unknown> = { ...req.body };
+      if (opts.autoCode && !rawBody[opts.autoCode.field]) {
+        rawBody[opts.autoCode.field] = await nextMasterNumber(prisma, {
+          tenantId,
+          entityType: opts.autoCode.entityType,
+          defaultPrefix: opts.autoCode.defaultPrefix,
+        });
+      }
+      const payload = opts.createSchema.parse(rawBody);
       const record = await delegate.create({ data: { ...payload, tenantId } });
       await writeAuditLog(prisma, {
         tenantId,

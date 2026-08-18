@@ -11,14 +11,9 @@ import { postJournal, recordPostingException } from "../../services/journalServi
 import { resolveCoaByCode } from "../../services/coaLookup";
 import { triggerApproval } from "../../services/approvalService";
 import { writeAuditLog } from "../../services/auditService";
+import { getCompanyPolicy } from "../../services/policyService";
 
 const router = Router();
-
-// PO/GRN/Invoice quantity & amount tolerance, per BRD 5.4 & 10.1
-// ("PO, GRN, and purchase invoice must support quantity and amount
-// tolerance controls"). Kept as a simple constant for MVP; promote to a
-// company policy setting in a later phase.
-const TOLERANCE_PCT = 0.02;
 
 // --- Vendors --------------------------------------------------------------
 router.use(
@@ -51,6 +46,7 @@ router.use(
     }),
     include: { country: true, city: true, area: true, paymentTerms: true, currency: true },
     sensitiveFields: { fields: ["bankName", "bankAccountNo", "iban"], requiredPermission: "Procurement.Vendor.ViewBankDetails" },
+    autoCode: { field: "code", entityType: "Vendor", defaultPrefix: "SUP" },
   })
 );
 
@@ -1256,11 +1252,21 @@ router.post(
       return sum + linesTotal;
     }, 0);
 
+    // Was a hardcoded 2% constant - now reads the company's own tolerance
+    // from the Company Policies screen (falls back to the same 2% if the
+    // admin hasn't set one, so existing behaviour doesn't change silently).
+    const tolerancePct = await getCompanyPolicy(prisma, {
+      tenantId,
+      companyId,
+      policyKey: "poGrnInvoiceTolerancePct",
+      defaultValue: 0.02,
+    });
+
     const variance = expectedAmount === 0 ? 0 : Math.abs(Number(invoice.gross) - expectedAmount) / expectedAmount;
-    if (variance > TOLERANCE_PCT) {
+    if (variance > tolerancePct) {
       throw ApiError.badRequest(
         `Invoice amount ${invoice.gross} exceeds tolerance vs matched GRN value ${expectedAmount.toFixed(2)} (variance ${(variance * 100).toFixed(1)}%)`,
-        { expectedAmount, invoiceGross: invoice.gross, tolerancePct: TOLERANCE_PCT }
+        { expectedAmount, invoiceGross: invoice.gross, tolerancePct }
       );
     }
 

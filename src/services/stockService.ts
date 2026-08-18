@@ -1,6 +1,8 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 import { assertPeriodOpen } from "./periodService";
 import { writeAuditLog } from "./auditService";
+import { getCompanyPolicy } from "./policyService";
+import { ApiError } from "../utils/errors";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -78,6 +80,25 @@ export async function postStockMovement(tx: Tx, input: StockMovementInput) {
   const priorQty = existingBalance ? Number(existingBalance.quantity) : 0;
   const priorValue = existingBalance ? Number(existingBalance.value) : 0;
   const priorAvgCost = priorQty !== 0 ? priorValue / priorQty : 0;
+
+  // Was never enforced anywhere before - defaults to true (today's actual
+  // behaviour: nothing blocks it) so turning this on is an explicit,
+  // opt-in choice from the Company Policies screen rather than a silent
+  // behaviour change for tenants who haven't touched that setting.
+  if (qtyOut > 0) {
+    const allowNegativeStock = await getCompanyPolicy(tx, {
+      tenantId,
+      companyId: warehouse.branch.companyId,
+      policyKey: "allowNegativeStock",
+      defaultValue: true,
+    });
+    if (!allowNegativeStock && priorQty - qtyOut < 0) {
+      throw ApiError.badRequest(
+        `This would take stock negative (have ${priorQty}, moving out ${qtyOut}) and this company's policy disallows negative stock.`,
+        { priorQty, qtyOut }
+      );
+    }
+  }
 
   const appliedUnitCost = qtyIn > 0 ? Number(input.unitCost) : priorAvgCost;
 

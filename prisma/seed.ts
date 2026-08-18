@@ -89,6 +89,20 @@ async function main() {
     },
   });
 
+  // Master-data code prefixes - visible in the Master Series screen from
+  // day one rather than only appearing after the first vendor/customer is
+  // saved (nextMasterNumber would create these lazily otherwise).
+  await prisma.masterSeries.upsert({
+    where: { tenantId_entityType: { tenantId: tenant.id, entityType: "Vendor" } },
+    update: {},
+    create: { tenantId: tenant.id, entityType: "Vendor", prefix: "SUP", digitLength: 4 },
+  });
+  await prisma.masterSeries.upsert({
+    where: { tenantId_entityType: { tenantId: tenant.id, entityType: "Customer" } },
+    update: {},
+    create: { tenantId: tenant.id, entityType: "Customer", prefix: "CUS", digitLength: 4 },
+  });
+
   const branch = await prisma.branch.upsert({
     where: { tenantId_companyId_code: { tenantId: tenant.id, companyId: company.id, code: "BR01" } },
     update: {},
@@ -253,7 +267,7 @@ async function main() {
   // against once you assign them to a user.
   const CRUD_SCREENS = [
     "Admin.Branch", "Admin.Company", "Admin.CostCentre", "Admin.DocumentSeries",
-    "Admin.FinancialPeriod", "Admin.ProfitCentre", "Admin.Warehouse",
+    "Admin.FinancialPeriod", "Admin.MasterSeries", "Admin.ProfitCentre", "Admin.Warehouse",
     "Finance.AccountGroup", "Finance.BankAccount", "Finance.ChartOfAccount",
     "Inventory.Item", "Inventory.ItemCategory", "Inventory.ItemPrice", "Inventory.ItemVendorMapping",
     "Masters.Area", "Masters.PaymentMethod", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
