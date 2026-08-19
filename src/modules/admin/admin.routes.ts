@@ -139,6 +139,7 @@ router.use(
       includeMonth: z.boolean().default(false),
     }),
     statusField: "resetPolicy", // no real status field on this master; activate/deactivate unused
+    listFilters: ["moduleCode"],
   })
 );
 
@@ -164,6 +165,7 @@ router.use(
       includeMonth: z.boolean().default(false),
     }),
     statusField: "prefix", // no real status column; activate/deactivate unused
+    listFilters: ["entityType"],
   })
 );
 
