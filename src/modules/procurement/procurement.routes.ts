@@ -12,6 +12,7 @@ import { resolveCoaByCode } from "../../services/coaLookup";
 import { triggerApproval } from "../../services/approvalService";
 import { writeAuditLog } from "../../services/auditService";
 import { resolvePolicy } from "../../services/policyRuleService";
+import { resolveUomQty } from "../../utils/uomConversion";
 
 const router = Router();
 
@@ -55,7 +56,6 @@ const mrLineSchema = z.object({
   itemId: z.string().uuid(),
   requestedQty: z.number().positive(),
   uomId: z.string().uuid(),
-  requiredDate: z.coerce.date().optional(),
 });
 
 router.get(
@@ -68,7 +68,7 @@ router.get(
     if (req.query.status) where.status = req.query.status;
     const items = await prisma.materialRequest.findMany({
       where,
-      include: { lines: true },
+      include: { lines: true, branch: true },
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
@@ -82,7 +82,7 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.materialRequest.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: true, uom: true } } },
+      include: { lines: { include: { item: { include: { baseUom: true } }, uom: true } }, branch: true },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
@@ -98,11 +98,19 @@ router.post(
       branchId: z.string().uuid(),
       companyId: z.string().uuid(),
       warehouseId: z.string().uuid().optional(),
-      sourceType: z.enum(["Branch", "Warehouse", "CentralKitchen", "Direct"]).default("Branch"),
-      requiredDate: z.coerce.date().optional(),
+      requestType: z.enum(["Material", "Service"]).default("Material"),
+      priority: z.enum(["Low", "Normal", "High", "Urgent"]).default("Normal"),
+      sourceType: z.enum(["Branch", "Warehouse", "CentralKitchen", "Direct"]).optional(),
+      validityDate: z.coerce.date().optional(),
       lines: z.array(mrLineSchema).min(1),
     });
     const payload = schema.parse(req.body);
+
+    const items = await prisma.item.findMany({
+      where: { tenantId, id: { in: payload.lines.map((l) => l.itemId) } },
+      select: { id: true, baseUomId: true },
+    });
+    const baseUomById = new Map(items.map((i) => [i.id, i.baseUomId]));
 
     const record = await prisma.$transaction(async (tx) => {
       const mrNo = await nextDocumentNumber(tx, {
@@ -111,16 +119,30 @@ router.post(
         moduleCode: "MaterialRequest",
         defaultPrefix: "MR",
       });
+
+      const linesWithBaseQty = await Promise.all(
+        payload.lines.map(async (l) => {
+          const baseUomId = baseUomById.get(l.itemId);
+          const baseQty = baseUomId
+            ? await resolveUomQty(tx, { tenantId, itemId: l.itemId, fromUomId: l.uomId, toUomId: baseUomId, qty: l.requestedQty })
+            : null;
+          return { ...l, tenantId, baseQty };
+        })
+      );
+
       return tx.materialRequest.create({
         data: {
           tenantId,
           branchId: payload.branchId,
           warehouseId: payload.warehouseId,
-          sourceType: payload.sourceType,
+          requesterId: req.user?.userId,
+          requestType: payload.requestType,
+          priority: payload.priority,
+          ...(payload.sourceType ? { sourceType: payload.sourceType } : {}),
+          validityDate: payload.validityDate,
           mrNo,
-          requiredDate: payload.requiredDate,
           lines: {
-            create: payload.lines.map((l) => ({ ...l, tenantId })),
+            create: linesWithBaseQty,
           },
         },
         include: { lines: true },
@@ -218,9 +240,17 @@ router.get(
     const excludeLineIds = alreadyConsolidated.map((l) => l.mrLineId);
 
     const lines = await prisma.materialRequestLine.findMany({
-      where: { tenantId, id: { notIn: excludeLineIds }, mr: { status } },
+      where: {
+        tenantId,
+        id: { notIn: excludeLineIds },
+        // Validity date is a demand-planning cutoff (see MaterialRequest
+        // model comment): an expired MR can still be viewed/reported on,
+        // it just drops out of the pool that consolidation/RFQ/PO draw
+        // from, same way an already-consolidated line is excluded above.
+        mr: { status, OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }] },
+      },
       include: { item: true, uom: true, mr: { include: { branch: true } } },
-      orderBy: { requiredDate: "asc" },
+      orderBy: { mr: { requestDate: "asc" } },
     });
 
     const byItem = new Map<

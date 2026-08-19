@@ -1404,10 +1404,14 @@ model MaterialRequest {
   branchId     String   @map("branch_id")
   warehouseId  String?  @map("warehouse_id")
   requesterId  String?  @map("requester_id")
+  requestType  String   @default("Material") @map("request_type") // Material|Service
+  priority     String   @default("Normal") // Low|Normal|High|Urgent
   sourceType   String   @default("Branch") @map("source_type") // Branch|Warehouse|CentralKitchen|Direct
   mrNo         String   @map("mr_no")
   requestDate  DateTime @default(now()) @map("request_date")
   requiredDate DateTime? @map("required_date")
+  /** After this date the MR is excluded from the MR Consolidation pool (and therefore from RFQ/PO) - see consolidation-pool query in procurement.routes.ts. Null = never expires. */
+  validityDate DateTime? @map("validity_date")
   status       String   @default("Draft") // Draft|Submitted|Approved|Rejected|Closed|Cancelled
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
@@ -1431,6 +1435,12 @@ model MaterialRequestLine {
   mrId          String   @map("mr_id")
   itemId        String   @map("item_id")
   requestedQty  Decimal  @db.Decimal(18, 3) @map("requested_qty")
+  /** requestedQty converted into the item's base UOM via UomConversion, so a
+   * line entered as "10 Box" still gives downstream demand-planning a real
+   * base-unit figure - see utils/uomConversion.ts. Null when no conversion
+   * path was configured between the entered unit and the item's base unit
+   * (requestedQty/uomId as entered is still authoritative either way). */
+  baseQty       Decimal? @db.Decimal(18, 3) @map("base_qty")
   approvedQty   Decimal? @db.Decimal(18, 3) @map("approved_qty")
   uomId         String   @map("uom_id")
   requiredDate  DateTime? @map("required_date")

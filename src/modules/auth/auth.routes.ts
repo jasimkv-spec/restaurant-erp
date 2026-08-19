@@ -102,7 +102,24 @@ router.post(
 
     await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
 
-    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles } });
+    // Branch scoping for document screens (e.g. Material Request's "auto-
+    // select the user's branch"): UserBranchAccess rows are an explicit
+    // allow-list. No rows at all means the user was never restricted (most
+    // admin/head-office users), so they see every active branch instead of
+    // being locked out entirely.
+    const branchAccess = await prisma.userBranchAccess.findMany({
+      where: { tenantId, userId: user.id },
+      select: { branch: { select: { id: true, code: true, name: true } } },
+    });
+    const branches = branchAccess.length
+      ? branchAccess.map((b) => b.branch)
+      : await prisma.branch.findMany({
+          where: { tenantId, status: "Active" },
+          select: { id: true, code: true, name: true },
+          orderBy: { code: "asc" },
+        });
+
+    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, branches } });
   })
 );
 
