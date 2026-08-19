@@ -343,6 +343,82 @@ router.use(
     }),
     include: { item: true, vendor: true },
     statusField: "vendorItemCode",
+    listFilters: ["itemId"],
+  })
+);
+
+// --- Item branch-level order quantities -------------------------------------
+// Per-branch min/max order quantity - the item's own reorderLevel/minStock/
+// maxStock are tenant-wide fallbacks; a branch with a row here overrides
+// them for purchasing purposes at that branch specifically.
+router.use(
+  "/item-branch-settings",
+  crudRouter(prisma.itemBranchSetting, {
+    permissionKey: "Inventory.ItemBranchSetting",
+    createSchema: z.object({
+      itemId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      minOrderQty: z.number().nonnegative().optional(),
+      maxOrderQty: z.number().nonnegative().optional(),
+    }),
+    include: { item: true, branch: true },
+    listFilters: ["itemId"],
+  })
+);
+
+// --- Item purchase / sales history (read-only) -------------------------------
+// Surfaced directly on the item edit screen so "which vendors have actually
+// supplied this" and "how has it been selling" don't require navigating to
+// the GRN/Sales Invoice modules separately - just the most recent lines,
+// newest first, capped at 20 so the panel stays fast.
+router.get(
+  "/items/:itemId/purchase-history",
+  requirePermission("Inventory.Item.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const lines = await prisma.grnLine.findMany({
+      where: { tenantId, itemId: req.params.itemId, grn: { tenantId } },
+      include: { grn: { include: { vendor: true, branch: true } } },
+      orderBy: { grn: { grnDate: "desc" } },
+      take: 20,
+    });
+    res.json({
+      data: lines.map((l) => ({
+        id: l.id,
+        grnDate: l.grn.grnDate,
+        grnNo: l.grn.grnNo,
+        vendor: l.grn.vendor ? { id: l.grn.vendor.id, code: l.grn.vendor.code, name: l.grn.vendor.name } : null,
+        branch: l.grn.branch?.name,
+        receivedQty: l.receivedQty,
+        acceptedQty: l.acceptedQty,
+        unitCost: l.unitCost,
+      })),
+    });
+  })
+);
+
+router.get(
+  "/items/:itemId/sales-history",
+  requirePermission("Inventory.Item.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const lines = await prisma.salesInvoiceLine.findMany({
+      where: { tenantId, itemId: req.params.itemId, salesInvoice: { tenantId } },
+      include: { salesInvoice: { include: { branch: true, customer: true } } },
+      orderBy: { salesInvoice: { businessDate: "desc" } },
+      take: 20,
+    });
+    res.json({
+      data: lines.map((l) => ({
+        id: l.id,
+        businessDate: l.salesInvoice.businessDate,
+        invoiceNo: l.salesInvoice.invoiceNo,
+        branch: l.salesInvoice.branch?.name,
+        customer: l.salesInvoice.customer?.name ?? "Walk-in / POS",
+        qty: l.qty,
+        unitPrice: l.unitPrice,
+      })),
+    });
   })
 );
 

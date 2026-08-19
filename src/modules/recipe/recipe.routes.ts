@@ -29,9 +29,22 @@ router.get(
   requirePermission("Recipe.Recipe.View"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
+    const where: Record<string, unknown> = { tenantId };
+    // Lets the item edit screen ask "does this product already have a
+    // recipe/BOM/kit?" without fetching every recipe in the tenant.
+    if (typeof req.query.outputItemId === "string" && req.query.outputItemId.length > 0) {
+      where.outputItemId = req.query.outputItemId;
+    }
     const items = await prisma.recipe.findMany({
-      where: { tenantId },
-      include: { outputItem: true, versions: { orderBy: { versionNo: "desc" }, take: 1 } },
+      where,
+      include: {
+        outputItem: true,
+        versions: {
+          orderBy: { versionNo: "desc" },
+          take: 1,
+          include: { ingredients: { include: { ingredientItem: true, uom: true } } },
+        },
+      },
       orderBy: { id: "desc" },
     });
     res.json({ data: items });

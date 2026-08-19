@@ -93,6 +93,7 @@ model Tenant {
   itemGlMappings       ItemGlMapping[]
   itemPrices           ItemPrice[]
   itemVendorMappings   ItemVendorMapping[]
+  itemBranchSettings   ItemBranchSetting[]
   priceGroups          PriceGroup[]
   priceGroupBranches   PriceGroupBranch[]
   stockLedgerEntries   StockLedger[]
@@ -303,6 +304,7 @@ model Branch {
   salesReturns        SalesReturn[]
   recipeCostSnapshots RecipeCostSnapshot[]
   productionPostings  ProductionPosting[]
+  itemBranchSettings  ItemBranchSetting[]
 
   @@unique([tenantId, companyId, code])
   @@index([tenantId])
@@ -1087,6 +1089,7 @@ model Item {
   glMapping           ItemGlMapping?
   prices               ItemPrice[]
   vendorMappings        ItemVendorMapping[]
+  branchSettings        ItemBranchSetting[]
   uomConversions        UomConversion[]
   stockLedgerEntries    StockLedger[]
   stockBalances         StockBalance[]
@@ -1202,6 +1205,29 @@ model ItemVendorMapping {
   @@unique([tenantId, itemId, vendorId])
   @@index([tenantId])
   @@map("item_vendor_mappings")
+}
+
+/// Per-branch purchasing limits for an item - the reorderLevel/minStock/
+/// maxStock fields on Item itself are tenant-wide fallbacks; this is for
+/// when a specific branch needs its own minimum and maximum order quantity
+/// (e.g. a small kiosk branch never orders more than X, a central kitchen
+/// always orders at least Y). A branch with no row here just uses the
+/// item-level defaults.
+model ItemBranchSetting {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  itemId       String   @map("item_id")
+  branchId     String   @map("branch_id")
+  minOrderQty  Decimal? @db.Decimal(18, 3) @map("min_order_qty")
+  maxOrderQty  Decimal? @db.Decimal(18, 3) @map("max_order_qty")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  item         Item     @relation(fields: [itemId], references: [id])
+  branch       Branch   @relation(fields: [branchId], references: [id])
+
+  @@unique([tenantId, itemId, branchId])
+  @@index([tenantId, itemId])
+  @@map("item_branch_settings")
 }
 
 /// Append-only inventory movement ledger. Never updated/deleted; corrections
