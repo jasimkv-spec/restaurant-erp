@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
@@ -58,6 +59,52 @@ const mrLineSchema = z.object({
   uomId: z.string().uuid(),
 });
 
+// Shared between create and edit - only create additionally needs
+// companyId (to resolve the numbering series the one time mrNo is minted).
+const mrHeaderSchema = z.object({
+  branchId: z.string().uuid(),
+  warehouseId: z.string().uuid().optional(),
+  // Reflected onto RFQ/PO/GRN as they're generated from this MR, so a buyer
+  // can trace any downstream document back to why it was raised.
+  title: z.string().min(1),
+  notes: z.string().optional(),
+  requestType: z.enum(["Material", "Service"]).default("Material"),
+  priority: z.enum(["Low", "Normal", "High", "Urgent"]).default("Normal"),
+  sourceType: z.enum(["Branch", "Warehouse", "CentralKitchen", "Direct"]).optional(),
+  // Transaction date - defaults to "now" (when the MR is created) but can be
+  // backdated by an authorized user, same convention as most other documents.
+  requestDate: z.coerce.date().optional(),
+  // "Requested by" - when the requester needs the goods. Distinct from
+  // validityDate below: this is informational, validityDate is enforced.
+  requiredDate: z.coerce.date().optional(),
+  // Hard cutoff - after this date the MR (and its lines) drop out of the MR
+  // Consolidation pool and therefore out of RFQ/PO. See consolidation-pool.
+  validityDate: z.coerce.date().optional(),
+});
+
+/** Resolves each line's baseQty (see MaterialRequestLine.baseQty comment) against the items' configured base UOM. */
+async function computeLinesWithBaseQty(
+  tx: Prisma.TransactionClient | typeof prisma,
+  tenantId: string,
+  lines: z.infer<typeof mrLineSchema>[]
+) {
+  const items = await tx.item.findMany({
+    where: { tenantId, id: { in: lines.map((l) => l.itemId) } },
+    select: { id: true, baseUomId: true },
+  });
+  const baseUomById = new Map(items.map((i) => [i.id, i.baseUomId]));
+
+  return Promise.all(
+    lines.map(async (l) => {
+      const baseUomId = baseUomById.get(l.itemId);
+      const baseQty = baseUomId
+        ? await resolveUomQty(tx, { tenantId, itemId: l.itemId, fromUomId: l.uomId, toUomId: baseUomId, qty: l.requestedQty })
+        : null;
+      return { ...l, tenantId, baseQty };
+    })
+  );
+}
+
 router.get(
   "/material-requests",
   requirePermission("Procurement.MaterialRequest.View"),
@@ -94,23 +141,11 @@ router.post(
   requirePermission("Procurement.MaterialRequest.Create"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({
-      branchId: z.string().uuid(),
+    const schema = mrHeaderSchema.extend({
       companyId: z.string().uuid(),
-      warehouseId: z.string().uuid().optional(),
-      requestType: z.enum(["Material", "Service"]).default("Material"),
-      priority: z.enum(["Low", "Normal", "High", "Urgent"]).default("Normal"),
-      sourceType: z.enum(["Branch", "Warehouse", "CentralKitchen", "Direct"]).optional(),
-      validityDate: z.coerce.date().optional(),
       lines: z.array(mrLineSchema).min(1),
     });
     const payload = schema.parse(req.body);
-
-    const items = await prisma.item.findMany({
-      where: { tenantId, id: { in: payload.lines.map((l) => l.itemId) } },
-      select: { id: true, baseUomId: true },
-    });
-    const baseUomById = new Map(items.map((i) => [i.id, i.baseUomId]));
 
     const record = await prisma.$transaction(async (tx) => {
       const mrNo = await nextDocumentNumber(tx, {
@@ -120,15 +155,7 @@ router.post(
         defaultPrefix: "MR",
       });
 
-      const linesWithBaseQty = await Promise.all(
-        payload.lines.map(async (l) => {
-          const baseUomId = baseUomById.get(l.itemId);
-          const baseQty = baseUomId
-            ? await resolveUomQty(tx, { tenantId, itemId: l.itemId, fromUomId: l.uomId, toUomId: baseUomId, qty: l.requestedQty })
-            : null;
-          return { ...l, tenantId, baseQty };
-        })
-      );
+      const linesWithBaseQty = await computeLinesWithBaseQty(tx, tenantId, payload.lines);
 
       return tx.materialRequest.create({
         data: {
@@ -136,9 +163,13 @@ router.post(
           branchId: payload.branchId,
           warehouseId: payload.warehouseId,
           requesterId: req.user?.userId,
+          title: payload.title,
+          notes: payload.notes,
           requestType: payload.requestType,
           priority: payload.priority,
           ...(payload.sourceType ? { sourceType: payload.sourceType } : {}),
+          ...(payload.requestDate ? { requestDate: payload.requestDate } : {}),
+          requiredDate: payload.requiredDate,
           validityDate: payload.validityDate,
           mrNo,
           lines: {
@@ -150,6 +181,98 @@ router.post(
     });
 
     res.status(201).json(record);
+  })
+);
+
+router.put(
+  "/material-requests/:id",
+  requirePermission("Procurement.MaterialRequest.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const payload = mrHeaderSchema.extend({ lines: z.array(mrLineSchema).min(1) }).parse(req.body);
+
+    const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot edit an MR in status ${existing.status} - only Draft MRs can be edited`);
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const linesWithBaseQty = await computeLinesWithBaseQty(tx, tenantId, payload.lines);
+      // Simplest correct way to let lines be added/removed/reordered on
+      // edit: replace the set entirely rather than diffing old vs new.
+      // Safe here because a Draft MR's lines can't yet be referenced by
+      // anything downstream (consolidation/RFQ/PO only ever pull from
+      // Approved MRs) - see the consolidation-pool query above.
+      await tx.materialRequestLine.deleteMany({ where: { mrId: existing.id } });
+      return tx.materialRequest.update({
+        where: { id: existing.id },
+        data: {
+          branchId: payload.branchId,
+          warehouseId: payload.warehouseId,
+          title: payload.title,
+          notes: payload.notes,
+          requestType: payload.requestType,
+          priority: payload.priority,
+          ...(payload.sourceType ? { sourceType: payload.sourceType } : {}),
+          ...(payload.requestDate ? { requestDate: payload.requestDate } : {}),
+          requiredDate: payload.requiredDate,
+          validityDate: payload.validityDate,
+          lines: { create: linesWithBaseQty },
+        },
+        include: { lines: true },
+      });
+    });
+
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.MaterialRequest",
+      recordTable: "material_requests",
+      recordId: record.id,
+      action: "Edited",
+      oldValue: existing,
+      newValue: payload,
+    });
+
+    res.json(record);
+  })
+);
+
+router.delete(
+  "/material-requests/:id",
+  requirePermission("Procurement.MaterialRequest.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot delete an MR in status ${existing.status} - only Draft MRs can be deleted`);
+    }
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.materialRequestLine.deleteMany({ where: { mrId: existing.id } });
+        await tx.materialRequest.delete({ where: { id: existing.id } });
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2003" || err.code === "P2014")) {
+        throw ApiError.badRequest("This material request is referenced elsewhere and can't be deleted.");
+      }
+      throw err;
+    }
+
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.MaterialRequest",
+      recordTable: "material_requests",
+      recordId: req.params.id,
+      action: "Deleted",
+      oldValue: existing,
+    });
+
+    res.status(204).send();
   })
 );
 

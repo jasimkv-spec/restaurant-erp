@@ -1404,6 +1404,11 @@ model MaterialRequest {
   branchId     String   @map("branch_id")
   warehouseId  String?  @map("warehouse_id")
   requesterId  String?  @map("requester_id")
+  // Carried onto every downstream document this MR feeds (RFQ, PO, GRN -
+  // see PurchaseOrderLine.sourceMrId/sourceMrLineId, RfqLine.sourceMrLineId)
+  // so a buyer can trace a GRN all the way back to why it was requested.
+  title        String   @default("")
+  notes        String?
   requestType  String   @default("Material") @map("request_type") // Material|Service
   priority     String   @default("Normal") // Low|Normal|High|Urgent
   sourceType   String   @default("Branch") @map("source_type") // Branch|Warehouse|CentralKitchen|Direct
