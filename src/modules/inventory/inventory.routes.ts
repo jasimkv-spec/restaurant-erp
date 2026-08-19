@@ -92,6 +92,7 @@ router.use(
       defaultInventoryGlId: z.string().uuid().optional(),
       defaultCogsGlId: z.string().uuid().optional(),
     }),
+    include: { parent: true },
   })
 );
 
@@ -115,6 +116,12 @@ router.use(
         "Service",
         "Spare",
       ]),
+      forSales: z.boolean().default(false),
+      forManufacture: z.boolean().default(false),
+      forFactory: z.boolean().default(false),
+      forPurchase: z.boolean().default(false),
+      forPos: z.boolean().default(false),
+      forExpense: z.boolean().default(false),
       shortName: z.string().max(30).optional(),
       barcode: z.string().optional(),
       categoryId: z.string().uuid().optional(),
@@ -147,6 +154,10 @@ router.use(
       fields: ["standardCost", "lastReceivedCost", "averageCost"],
       requiredPermission: "Inventory.Item.ViewCost",
     },
+    // Lets Raw Materials Master / Menu Master / Item Master each show a
+    // pre-filtered slice of this same table via ?itemType=a,b,c - see
+    // pages/products/ProductItemsView.tsx on the frontend.
+    listFilters: ["itemType"],
   })
 );
 
@@ -206,6 +217,20 @@ router.get(
 );
 
 // --- Item GL Mapping -----------------------------------------------------------
+// One-to-one with Item (upsert keyed by itemId) - which accounts a
+// product's stock, cost of goods, revenue, expense, and wastage should
+// post to, overriding the company-wide control accounts that
+// coaLookup.ts's resolveCoaByCode() falls back to today.
+router.get(
+  "/item-gl-mappings/:itemId",
+  requirePermission("Inventory.ItemGlMapping.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.itemGlMapping.findFirst({ where: { itemId: req.params.itemId, tenantId } });
+    res.json(record ?? { itemId: req.params.itemId });
+  })
+);
+
 router.post(
   "/item-gl-mappings",
   requirePermission("Inventory.ItemGlMapping.Create"),
@@ -229,6 +254,60 @@ router.post(
   })
 );
 
+// --- Price Groups (named sets of branches that share one selling price) ---
+// Create the group, assign branches to it below, then Item Prices picks a
+// price group instead of a single branch - one price row covers every
+// branch in the group.
+router.use(
+  "/price-groups",
+  crudRouter(prisma.priceGroup, {
+    permissionKey: "Inventory.PriceGroup",
+    createSchema: z.object({ code: z.string().min(1).max(30), name: z.string().min(1) }),
+  })
+);
+
+router.get(
+  "/price-groups/:id/branches",
+  requirePermission("Inventory.PriceGroup.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const rows = await prisma.priceGroupBranch.findMany({
+      where: { tenantId, priceGroupId: req.params.id },
+      include: { branch: true },
+    });
+    res.json({ data: rows });
+  })
+);
+
+router.post(
+  "/price-groups/:id/branches",
+  requirePermission("Inventory.PriceGroup.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ branchId: z.string().uuid() });
+    const { branchId } = schema.parse(req.body);
+    const record = await prisma.priceGroupBranch.create({
+      data: { tenantId, priceGroupId: req.params.id, branchId },
+      include: { branch: true },
+    });
+    res.status(201).json(record);
+  })
+);
+
+router.delete(
+  "/price-groups/:id/branches/:branchLinkId",
+  requirePermission("Inventory.PriceGroup.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.priceGroupBranch.findFirst({
+      where: { id: req.params.branchLinkId, tenantId, priceGroupId: req.params.id },
+    });
+    if (!existing) throw ApiError.notFound();
+    await prisma.priceGroupBranch.delete({ where: { id: existing.id } });
+    res.status(204).send();
+  })
+);
+
 // --- Item Pricing -----------------------------------------------------------
 router.use(
   "/item-prices",
@@ -236,6 +315,7 @@ router.use(
     permissionKey: "Inventory.ItemPrice",
     createSchema: z.object({
       itemId: z.string().uuid(),
+      priceGroupId: z.string().uuid().optional(),
       branchId: z.string().uuid().optional(),
       channelId: z.string().uuid().optional(),
       customerGroupId: z.string().uuid().optional(),
@@ -243,6 +323,7 @@ router.use(
       effectiveFrom: z.coerce.date().optional(),
       effectiveTo: z.coerce.date().optional(),
     }),
+    include: { item: true, priceGroup: true, branch: true, channel: true },
     statusField: "customerGroupId",
   })
 );
@@ -259,6 +340,7 @@ router.use(
       leadTimeDays: z.number().int().nonnegative().optional(),
       lastPrice: z.number().nonnegative().optional(),
     }),
+    include: { item: true, vendor: true },
     statusField: "vendorItemCode",
   })
 );

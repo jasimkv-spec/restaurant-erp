@@ -93,6 +93,8 @@ model Tenant {
   itemGlMappings       ItemGlMapping[]
   itemPrices           ItemPrice[]
   itemVendorMappings   ItemVendorMapping[]
+  priceGroups          PriceGroup[]
+  priceGroupBranches   PriceGroupBranch[]
   stockLedgerEntries   StockLedger[]
   stockBalances        StockBalance[]
   stockAdjustments     StockAdjustment[]
@@ -289,6 +291,7 @@ model Branch {
   salesImportBatches  SalesImportBatch[]
   consumptionPostings ConsumptionPosting[]
   itemPrices          ItemPrice[]
+  priceGroupBranches  PriceGroupBranch[]
   userBranchAccess    UserBranchAccess[]
   rfqs                Rfq[]
   goodsReturns        GoodsReturn[]
@@ -1032,6 +1035,16 @@ model Item {
   shortName       String?  @map("short_name") // print/receipt name, kept short for POS/kitchen tickets
   barcode         String?
   itemType        String   @map("item_type") // Sellable|Stock|Non-stock|Stationary|Menu|Semi-finished|Finished|Packaging|Service|Spare
+  // Which contexts this product participates in, independent of itemType -
+  // matches the Sales/Manufacture/Factory/Purchase/POS/Expenses toggles a
+  // product form typically shows. All default false so nothing is assumed;
+  // an item can have any combination switched on.
+  forSales        Boolean  @default(false) @map("for_sales")
+  forManufacture  Boolean  @default(false) @map("for_manufacture")
+  forFactory      Boolean  @default(false) @map("for_factory")
+  forPurchase     Boolean  @default(false) @map("for_purchase")
+  forPos          Boolean  @default(false) @map("for_pos")
+  forExpense      Boolean  @default(false) @map("for_expense")
   categoryId      String?  @map("category_id")
   groupId         String?  @map("group_id")
   subgroupId      String?  @map("subgroup_id")
@@ -1117,11 +1130,46 @@ model ItemGlMapping {
   @@map("item_gl_mappings")
 }
 
+/// A named set of branches that share one selling price per item (e.g.
+/// "Downtown outlets" vs "Mall outlets") - set the price once per group
+/// instead of once per branch. See PriceGroupBranch for membership.
+model PriceGroup {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id])
+  branches   PriceGroupBranch[]
+  itemPrices ItemPrice[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("price_groups")
+}
+
+model PriceGroupBranch {
+  id           String @id @default(uuid())
+  tenantId     String @map("tenant_id")
+  priceGroupId String @map("price_group_id")
+  branchId     String @map("branch_id")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id])
+  priceGroup PriceGroup @relation(fields: [priceGroupId], references: [id])
+  branch     Branch     @relation(fields: [branchId], references: [id])
+
+  @@unique([tenantId, priceGroupId, branchId])
+  @@index([tenantId])
+  @@map("price_group_branches")
+}
+
 model ItemPrice {
   id               String    @id @default(uuid())
   tenantId         String    @map("tenant_id")
   itemId           String    @map("item_id")
-  branchId         String?   @map("branch_id")
+  priceGroupId     String?   @map("price_group_id") // preferred - price applies to every branch in the group
+  branchId         String?   @map("branch_id")       // legacy/override - a single branch, bypassing any price group
   channelId        String?   @map("channel_id")
   customerGroupId  String?   @map("customer_group_id")
   price            Decimal   @default(0) @db.Decimal(18, 3)
@@ -1130,6 +1178,7 @@ model ItemPrice {
 
   tenant           Tenant    @relation(fields: [tenantId], references: [id])
   item             Item      @relation(fields: [itemId], references: [id])
+  priceGroup       PriceGroup? @relation(fields: [priceGroupId], references: [id])
   branch           Branch?   @relation(fields: [branchId], references: [id])
   channel          SalesChannel? @relation(fields: [channelId], references: [id])
 

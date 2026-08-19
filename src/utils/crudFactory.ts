@@ -65,6 +65,15 @@ export interface CrudOptions {
    * in when the field is missing/empty.
    */
   autoCode?: { field: string; entityType: string; defaultPrefix: string };
+  /**
+   * Field names the list endpoint accepts as exact-match (or comma-
+   * separated "in list") query filters, e.g. listFilters: ["itemType"]
+   * lets GET /items?itemType=Stock,Semi-finished narrow the list without a
+   * one-off route - used to split one underlying table into several
+   * pre-filtered screens (Raw Materials / Menu / Item Master all read the
+   * same Item table, just with a different itemType filter).
+   */
+  listFilters?: string[];
 }
 
 function maskSensitive<T extends Record<string, any>>(record: T, opts: CrudOptions, req: { user?: any }): T {
@@ -100,6 +109,13 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
           { code: { contains: search, mode: "insensitive" } },
           { name: { contains: search, mode: "insensitive" } },
         ];
+      }
+      for (const field of opts.listFilters ?? []) {
+        const raw = req.query[field];
+        if (typeof raw === "string" && raw.length > 0) {
+          const values = raw.split(",");
+          where[field] = values.length > 1 ? { in: values } : values[0];
+        }
       }
 
       // Not every model has a createdAt column (most master-data tables
