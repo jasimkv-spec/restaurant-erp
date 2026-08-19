@@ -101,6 +101,7 @@ router.use(
   "/items",
   crudRouter(prisma.item, {
     permissionKey: "Inventory.Item",
+    autoCode: { field: "code", entityType: "Item", defaultPrefix: "ITM" },
     createSchema: z.object({
       code: z.string().min(1).max(50),
       name: z.string().min(1),
