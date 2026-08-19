@@ -8,7 +8,7 @@ export interface AuditLogInput {
   moduleCode: string;
   recordTable: string;
   recordId: string;
-  action: "Created" | "Edited" | "Submitted" | "Approved" | "Rejected" | "Posted" | "Cancelled" | "Reopened" | "Activated" | "Deactivated";
+  action: "Created" | "Edited" | "Deleted" | "Submitted" | "Approved" | "Rejected" | "Posted" | "Cancelled" | "Reopened" | "Activated" | "Deactivated";
   oldValue?: unknown;
   newValue?: unknown;
 }

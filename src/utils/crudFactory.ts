@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { z, ZodTypeAny } from "zod";
 import { prisma } from "../lib/prisma";
 import { asyncHandler } from "./asyncHandler";
@@ -30,6 +31,7 @@ interface Delegate {
   findFirst: (args: any) => Promise<any>;
   create: (args: any) => Promise<any>;
   update: (args: any) => Promise<any>;
+  delete: (args: any) => Promise<any>;
 }
 
 export interface CrudOptions {
@@ -267,6 +269,49 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
         action: "Activated",
       });
       res.json(record);
+    })
+  );
+
+  /**
+   * Hard delete - only actually removes the row when nothing else
+   * references it. No model in schema.prisma declares onDelete: Cascade,
+   * so Postgres/Prisma's default (restrict) means attempting to delete a
+   * record that any transaction still points to (a Vendor with POs, an
+   * Item with GRN/sales lines, a Customer with invoices, etc.) throws a
+   * foreign-key-constraint error - caught below and turned into a message
+   * pointing the user at Deactivate instead, which is always safe. This
+   * needs no per-model "is it referenced" logic to stay correct as new
+   * transactional modules get added later.
+   */
+  router.delete(
+    "/:id",
+    requirePermission(`${opts.permissionKey}.Edit`),
+    asyncHandler(async (req, res) => {
+      const tenantId = req.tenant!.id;
+      const existing = await delegate.findFirst({ where: { id: req.params.id, tenantId } });
+      if (!existing) throw ApiError.notFound();
+
+      try {
+        await delegate.delete({ where: { id: req.params.id } });
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2003" || err.code === "P2014")) {
+          throw ApiError.badRequest(
+            "This record is used by one or more transactions and can't be deleted - use Disable instead."
+          );
+        }
+        throw err;
+      }
+
+      await writeAuditLog(prisma, {
+        tenantId,
+        userId: req.user?.userId,
+        moduleCode: opts.permissionKey,
+        recordTable: opts.permissionKey,
+        recordId: req.params.id,
+        action: "Deleted",
+        oldValue: existing,
+      });
+      res.status(204).send();
     })
   );
 
