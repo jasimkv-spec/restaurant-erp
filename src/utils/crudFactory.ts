@@ -63,8 +63,18 @@ export interface CrudOptions {
    * create when the caller left it blank - e.g. Vendor "code" becoming
    * "SUP0001". A manually-supplied value always wins, so this only kicks
    * in when the field is missing/empty.
+   *
+   * entityType/defaultPrefix can be a plain string (one series for the
+   * whole router, e.g. Vendor/Customer) or a function of the raw create
+   * body (lets one router serve several distinct series - e.g. Item's
+   * router is shared by Raw Materials/Menu/Item Master, so the series
+   * picked depends on the itemType being created - see inventory.routes.ts).
    */
-  autoCode?: { field: string; entityType: string; defaultPrefix: string };
+  autoCode?: {
+    field: string;
+    entityType: string | ((body: Record<string, unknown>) => string);
+    defaultPrefix: string | ((body: Record<string, unknown>) => string);
+  };
   /**
    * Field names the list endpoint accepts as exact-match (or comma-
    * separated "in list") query filters, e.g. listFilters: ["itemType"]
@@ -161,10 +171,16 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
       const tenantId = req.tenant!.id;
       const rawBody: Record<string, unknown> = { ...req.body };
       if (opts.autoCode) {
+        const entityType =
+          typeof opts.autoCode.entityType === "function" ? opts.autoCode.entityType(rawBody) : opts.autoCode.entityType;
+        const defaultPrefix =
+          typeof opts.autoCode.defaultPrefix === "function"
+            ? opts.autoCode.defaultPrefix(rawBody)
+            : opts.autoCode.defaultPrefix;
         const resolved = await resolveMasterCode(prisma, {
           tenantId,
-          entityType: opts.autoCode.entityType,
-          defaultPrefix: opts.autoCode.defaultPrefix,
+          entityType,
+          defaultPrefix,
           providedValue: rawBody[opts.autoCode.field] as string | undefined,
         });
         if (resolved !== undefined) rawBody[opts.autoCode.field] = resolved;

@@ -107,6 +107,16 @@ async function main() {
     update: {},
     create: { tenantId: tenant.id, entityType: "Item", prefix: "ITM", digitLength: 4 },
   });
+  await prisma.masterSeries.upsert({
+    where: { tenantId_entityType: { tenantId: tenant.id, entityType: "RawMaterial" } },
+    update: {},
+    create: { tenantId: tenant.id, entityType: "RawMaterial", prefix: "RM", digitLength: 4 },
+  });
+  await prisma.masterSeries.upsert({
+    where: { tenantId_entityType: { tenantId: tenant.id, entityType: "MenuItem" } },
+    update: {},
+    create: { tenantId: tenant.id, entityType: "MenuItem", prefix: "MEN", digitLength: 4 },
+  });
 
   const branch = await prisma.branch.upsert({
     where: { tenantId_companyId_code: { tenantId: tenant.id, companyId: company.id, code: "BR01" } },

@@ -97,11 +97,37 @@ router.use(
 );
 
 // --- Items (item / product master) -----------------------------------------------------------
+// Raw Materials Master, Menu Master, and Item Master are all this same
+// table (see the listFilters below), so a single static autoCode series
+// would give every one of them the same prefix. Instead the series is
+// picked per-record from the itemType being created, so each of the three
+// screens gets its own distinct code series in Master Series.
+const ITEM_AUTO_CODE_SERIES: Record<string, { entityType: string; defaultPrefix: string }> = {
+  Stock: { entityType: "RawMaterial", defaultPrefix: "RM" },
+  "Semi-finished": { entityType: "RawMaterial", defaultPrefix: "RM" },
+  Finished: { entityType: "RawMaterial", defaultPrefix: "RM" },
+  Sellable: { entityType: "MenuItem", defaultPrefix: "MEN" },
+  Menu: { entityType: "MenuItem", defaultPrefix: "MEN" },
+  "Non-stock": { entityType: "Item", defaultPrefix: "ITM" },
+  Stationary: { entityType: "Item", defaultPrefix: "ITM" },
+  Packaging: { entityType: "Item", defaultPrefix: "ITM" },
+  Service: { entityType: "Item", defaultPrefix: "ITM" },
+  Spare: { entityType: "Item", defaultPrefix: "ITM" },
+};
+function itemAutoCodeSeries(body: Record<string, unknown>) {
+  const itemType = typeof body.itemType === "string" ? body.itemType : "";
+  return ITEM_AUTO_CODE_SERIES[itemType] ?? { entityType: "Item", defaultPrefix: "ITM" };
+}
+
 router.use(
   "/items",
   crudRouter(prisma.item, {
     permissionKey: "Inventory.Item",
-    autoCode: { field: "code", entityType: "Item", defaultPrefix: "ITM" },
+    autoCode: {
+      field: "code",
+      entityType: (body) => itemAutoCodeSeries(body).entityType,
+      defaultPrefix: (body) => itemAutoCodeSeries(body).defaultPrefix,
+    },
     createSchema: z.object({
       code: z.string().min(1).max(50),
       name: z.string().min(1),
