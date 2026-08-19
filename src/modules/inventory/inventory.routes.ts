@@ -325,6 +325,7 @@ router.use(
     }),
     include: { item: true, priceGroup: true, branch: true, channel: true },
     statusField: "customerGroupId",
+    listFilters: ["itemId"],
   })
 );
 
