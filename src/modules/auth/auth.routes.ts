@@ -109,17 +109,22 @@ router.post(
     // being locked out entirely.
     const branchAccess = await prisma.userBranchAccess.findMany({
       where: { tenantId, userId: user.id },
-      select: { branch: { select: { id: true, code: true, name: true } } },
+      select: { branch: { select: { id: true, code: true, name: true, companyId: true, defaultWarehouseId: true } } },
     });
     const branches = branchAccess.length
       ? branchAccess.map((b) => b.branch)
       : await prisma.branch.findMany({
           where: { tenantId, status: "Active" },
-          select: { id: true, code: true, name: true },
+          select: { id: true, code: true, name: true, companyId: true, defaultWarehouseId: true },
           orderBy: { code: "asc" },
         });
 
-    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, branches } });
+    // permissions travels in the JWT already (for server-side requirePermission
+    // checks) but was never handed back in the response body - screens like
+    // Material Request need it client-side too, e.g. to only attempt an
+    // Inventory.StockBalance.View call for users who'd actually be allowed to
+    // see it, rather than firing a request that's just going to 403.
+    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, permissions, branches } });
   })
 );
 

@@ -1456,6 +1456,10 @@ model MaterialRequestLine {
   approvedQty   Decimal? @db.Decimal(18, 3) @map("approved_qty")
   uomId         String   @map("uom_id")
   requiredDate  DateTime? @map("required_date")
+  // Free-text note on this specific line (e.g. "urgent - out of stock at
+  // branch"), non-mandatory. Distinct from MaterialRequest.notes, which is
+  // header-level for the whole document.
+  remark        String?
 
   tenant        Tenant           @relation(fields: [tenantId], references: [id])
   mr            MaterialRequest  @relation(fields: [mrId], references: [id])

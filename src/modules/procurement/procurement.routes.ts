@@ -57,6 +57,7 @@ const mrLineSchema = z.object({
   itemId: z.string().uuid(),
   requestedQty: z.number().positive(),
   uomId: z.string().uuid(),
+  remark: z.string().optional(),
 });
 
 // Shared between create and edit - only create additionally needs
@@ -124,6 +125,132 @@ router.get(
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
+  })
+);
+
+/**
+ * Lets the line-entry screen warn "this item already has an open MR for
+ * this branch" before the user saves a duplicate by mistake. Open = any
+ * status other than a side-branch dead end (there's currently no
+ * Rejected/Cancelled status on MaterialRequest, so today that just means
+ * every status - kept as an explicit exclusion list rather than an
+ * inclusion list so a future terminal status doesn't need this route
+ * updated to stay correct). excludeId lets an edit-in-progress MR ignore
+ * its own lines when checking itself.
+ *
+ * Registered ahead of GET /material-requests/:id on purpose - Express
+ * matches routes in registration order, and ":id" would otherwise swallow
+ * "check-duplicate" as if it were an id (same reason consolidation-pool
+ * below needs to stay ahead of it too).
+ */
+router.get(
+  "/material-requests/check-duplicate",
+  requirePermission("Procurement.MaterialRequest.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      itemId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      excludeId: z.string().uuid().optional(),
+    });
+    const { itemId, branchId, excludeId } = schema.parse(req.query);
+
+    const lines = await prisma.materialRequestLine.findMany({
+      where: {
+        tenantId,
+        itemId,
+        mr: {
+          branchId,
+          status: { notIn: ["Rejected", "Cancelled"] },
+          ...(excludeId ? { id: { not: excludeId } } : {}),
+        },
+      },
+      include: { mr: { select: { id: true, mrNo: true, status: true, requestDate: true, title: true } }, uom: true },
+      orderBy: { mr: { requestDate: "desc" } },
+      take: 10,
+    });
+
+    res.json({
+      data: lines.map((l) => ({
+        mrId: l.mr.id,
+        mrNo: l.mr.mrNo,
+        title: l.mr.title,
+        status: l.mr.status,
+        requestDate: l.mr.requestDate,
+        requestedQty: l.requestedQty,
+        uomCode: l.uom.code,
+      })),
+    });
+  })
+);
+
+/**
+ * Head-office view: every approved MR line across every branch (not just
+ * one), grouped by item, so head office can see total tenant-wide demand
+ * for an item before deciding whether to consolidate it into a purchase
+ * (External -> RFQ/PO) or pull it from another branch's stock instead
+ * (Internal -> inter-branch transfer). Lines already picked into an active
+ * consolidation are excluded so nothing gets consolidated twice.
+ *
+ * Also registered ahead of GET /material-requests/:id - same
+ * route-ordering reason as check-duplicate above.
+ */
+router.get(
+  "/material-requests/consolidation-pool",
+  requirePermission("Procurement.MrConsolidation.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const status = typeof req.query.status === "string" ? req.query.status : "Approved";
+
+    const alreadyConsolidated = await prisma.mrConsolidationLine.findMany({
+      where: { tenantId, consolidation: { status: { not: "Cancelled" } } },
+      select: { mrLineId: true },
+    });
+    const excludeLineIds = alreadyConsolidated.map((l) => l.mrLineId);
+
+    const lines = await prisma.materialRequestLine.findMany({
+      where: {
+        tenantId,
+        id: { notIn: excludeLineIds },
+        // Validity date is a demand-planning cutoff (see MaterialRequest
+        // model comment): an expired MR can still be viewed/reported on,
+        // it just drops out of the pool that consolidation/RFQ/PO draw
+        // from, same way an already-consolidated line is excluded above.
+        mr: { status, OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }] },
+      },
+      include: { item: true, uom: true, mr: { include: { branch: true } } },
+      orderBy: { mr: { requestDate: "asc" } },
+    });
+
+    const byItem = new Map<
+      string,
+      { itemId: string; itemCode: string; itemName: string; uomCode: string; totalQty: number; branches: unknown[] }
+    >();
+    for (const line of lines) {
+      const qty = Number(line.approvedQty ?? line.requestedQty);
+      if (!byItem.has(line.itemId)) {
+        byItem.set(line.itemId, {
+          itemId: line.itemId,
+          itemCode: line.item.code,
+          itemName: line.item.name,
+          uomCode: line.uom.code,
+          totalQty: 0,
+          branches: [],
+        });
+      }
+      const entry = byItem.get(line.itemId)!;
+      entry.totalQty += qty;
+      entry.branches.push({
+        branchId: line.mr.branchId,
+        branchName: line.mr.branch.name,
+        mrId: line.mrId,
+        mrNo: line.mr.mrNo,
+        mrLineId: line.id,
+        qty,
+      });
+    }
+
+    res.json({ data: Array.from(byItem.values()) });
   })
 );
 
@@ -363,73 +490,6 @@ router.post(
 );
 
 // --- MR Consolidation -------------------------------------------------------
-
-/**
- * Head-office view: every approved MR line across every branch (not just
- * one), grouped by item, so head office can see total tenant-wide demand
- * for an item before deciding whether to consolidate it into a purchase
- * (External -> RFQ/PO) or pull it from another branch's stock instead
- * (Internal -> inter-branch transfer). Lines already picked into an active
- * consolidation are excluded so nothing gets consolidated twice.
- */
-router.get(
-  "/material-requests/consolidation-pool",
-  requirePermission("Procurement.MrConsolidation.View"),
-  asyncHandler(async (req, res) => {
-    const tenantId = req.tenant!.id;
-    const status = typeof req.query.status === "string" ? req.query.status : "Approved";
-
-    const alreadyConsolidated = await prisma.mrConsolidationLine.findMany({
-      where: { tenantId, consolidation: { status: { not: "Cancelled" } } },
-      select: { mrLineId: true },
-    });
-    const excludeLineIds = alreadyConsolidated.map((l) => l.mrLineId);
-
-    const lines = await prisma.materialRequestLine.findMany({
-      where: {
-        tenantId,
-        id: { notIn: excludeLineIds },
-        // Validity date is a demand-planning cutoff (see MaterialRequest
-        // model comment): an expired MR can still be viewed/reported on,
-        // it just drops out of the pool that consolidation/RFQ/PO draw
-        // from, same way an already-consolidated line is excluded above.
-        mr: { status, OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }] },
-      },
-      include: { item: true, uom: true, mr: { include: { branch: true } } },
-      orderBy: { mr: { requestDate: "asc" } },
-    });
-
-    const byItem = new Map<
-      string,
-      { itemId: string; itemCode: string; itemName: string; uomCode: string; totalQty: number; branches: unknown[] }
-    >();
-    for (const line of lines) {
-      const qty = Number(line.approvedQty ?? line.requestedQty);
-      if (!byItem.has(line.itemId)) {
-        byItem.set(line.itemId, {
-          itemId: line.itemId,
-          itemCode: line.item.code,
-          itemName: line.item.name,
-          uomCode: line.uom.code,
-          totalQty: 0,
-          branches: [],
-        });
-      }
-      const entry = byItem.get(line.itemId)!;
-      entry.totalQty += qty;
-      entry.branches.push({
-        branchId: line.mr.branchId,
-        branchName: line.mr.branch.name,
-        mrId: line.mrId,
-        mrNo: line.mr.mrNo,
-        mrLineId: line.id,
-        qty,
-      });
-    }
-
-    res.json({ data: Array.from(byItem.values()) });
-  })
-);
 
 router.post(
   "/mr-consolidations",
