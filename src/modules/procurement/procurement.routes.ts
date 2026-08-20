@@ -338,7 +338,7 @@ router.post(
       // Approve, never something the client can supply itself.
       await tx.materialRequest.update({
         where: { id: existing.id },
-        data: { status: "Approved", approvedById: req.user?.userId },
+        data: { status: "Approved", approvedById: req.user?.userId, approvedAt: new Date() },
       });
     });
 

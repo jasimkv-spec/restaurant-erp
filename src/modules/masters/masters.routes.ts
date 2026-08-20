@@ -246,6 +246,26 @@ router.get(
   })
 );
 
+router.put(
+  "/uom-conversions/:id",
+  requirePermission("Masters.UomConversion.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.uomConversion.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const schema = z.object({
+      itemId: z.string().uuid().optional(),
+      fromUomId: z.string().uuid(),
+      toUomId: z.string().uuid(),
+      factor: z.number().positive(),
+      effectiveFrom: z.coerce.date().optional(),
+    });
+    const payload = schema.parse(req.body);
+    const record = await prisma.uomConversion.update({ where: { id: existing.id }, data: payload });
+    res.json(record);
+  })
+);
+
 // --- Payment Terms -----------------------------------------------------------
 router.use(
   "/terms",

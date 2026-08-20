@@ -316,7 +316,7 @@ async function main() {
     "Inventory.StockAdjustment.Submit", "Inventory.StockAdjustment.View",
     "Masters.Country.View", "Masters.Country.Create", "Masters.City.View", "Masters.City.Create",
     "Masters.Currency.Create", "Masters.Currency.Edit", "Masters.Currency.View",
-    "Masters.UomConversion.Create", "Masters.UomConversion.View",
+    "Masters.UomConversion.Create", "Masters.UomConversion.Edit", "Masters.UomConversion.View",
     "Procurement.Grn.Create", "Procurement.Grn.Post", "Procurement.Grn.View",
     "Procurement.GoodsReturn.Create", "Procurement.GoodsReturn.Post", "Procurement.GoodsReturn.View",
     "Procurement.MaterialRequest.Approve", "Procurement.MaterialRequest.Create", "Procurement.MaterialRequest.Edit",
