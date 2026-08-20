@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
@@ -263,6 +264,31 @@ router.put(
     const payload = schema.parse(req.body);
     const record = await prisma.uomConversion.update({ where: { id: existing.id }, data: payload });
     res.json(record);
+  })
+);
+
+// Hard delete - a conversion row that's already been used to resolve a
+// baseQty on a submitted document has no FK pointing back at it (baseQty is
+// just a snapshot number on the line, not a live reference), so unlike
+// crudFactory's generic delete this one can't be blocked by a foreign-key
+// error in practice. Kept the same try/catch shape anyway in case a future
+// module ever does reference UomConversion directly.
+router.delete(
+  "/uom-conversions/:id",
+  requirePermission("Masters.UomConversion.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.uomConversion.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    try {
+      await prisma.uomConversion.delete({ where: { id: existing.id } });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2003" || err.code === "P2014")) {
+        throw ApiError.badRequest("This conversion is referenced elsewhere and can't be deleted.");
+      }
+      throw err;
+    }
+    res.status(204).send();
   })
 );
 
