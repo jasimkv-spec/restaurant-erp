@@ -119,12 +119,27 @@ router.post(
           orderBy: { code: "asc" },
         });
 
+    // Company-level session scoping: right after login the user picks either
+    // a single company (everything - masters, transactions, settings -
+    // scoped to it) or "All companies / Global" (every transaction then
+    // needs its own Company picked explicitly, same as today's behavior).
+    // The company list offered is simply every company touched by the
+    // branches resolved above, so it's automatically consistent with
+    // whatever branch-restriction (or lack of one) already applies to this
+    // user - no separate UserCompanyAccess table needed.
+    const companyIds = [...new Set(branches.map((b) => b.companyId))];
+    const companies = await prisma.company.findMany({
+      where: { tenantId, id: { in: companyIds } },
+      select: { id: true, code: true, name: true },
+      orderBy: { code: "asc" },
+    });
+
     // permissions travels in the JWT already (for server-side requirePermission
     // checks) but was never handed back in the response body - screens like
     // Material Request need it client-side too, e.g. to only attempt an
     // Inventory.StockBalance.View call for users who'd actually be allowed to
     // see it, rather than firing a request that's just going to 403.
-    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, permissions, branches } });
+    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, permissions, branches, companies } });
   })
 );
 

@@ -238,6 +238,12 @@ model Company {
   address        String?
   logoUrl        String?  @map("logo_url")
   dateFormat     String   @default("dd-MM-yyyy") @map("date_format")
+  timeFormat     String   @default("24h") @map("time_format")
+  // Free text shown on every printed transaction for this company (e.g. a
+  // registered-address/VAT line above the lines table, or terms/signature
+  // block below it) - see DocumentScreen.printRecord.
+  transactionHeaderText String? @map("transaction_header_text")
+  transactionFooterText String? @map("transaction_footer_text")
   status         String   @default("Active")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")

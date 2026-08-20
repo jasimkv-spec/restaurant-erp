@@ -24,6 +24,9 @@ router.use(
       address: z.string().optional(),
       logoUrl: z.string().optional(),
       dateFormat: z.string().default("dd-MM-yyyy"),
+      timeFormat: z.enum(["24h", "12h"]).default("24h"),
+      transactionHeaderText: z.string().optional(),
+      transactionFooterText: z.string().optional(),
     }),
     include: { baseCurrency: true },
   })
