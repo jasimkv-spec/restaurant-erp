@@ -542,6 +542,24 @@ model User {
   passwordHash      String   @map("password_hash")
   linkedEmployeeId  String?  @map("linked_employee_id")
   status            String   @default("Invited") // Invited|Active|Locked|Inactive
+  /// Short human-friendly identifier shown alongside the name (e.g. "U001") -
+  /// purely a label, not used for lookups anywhere (email + id remain the
+  /// real identifiers).
+  code              String?
+  /// Free-text note about this user/account (role in the business, contact
+  /// notes, etc.) - shown on the Users screen only.
+  description       String?
+  /// Whether this user is allowed to pick "All companies / Global" on the
+  /// post-login company-scope screen (see ChooseCompany.tsx). false forces
+  /// them to always work inside a single company even if their branch
+  /// access spans more than one - e.g. a branch manager who should never
+  /// see other branches' data mixed together. Defaults true so this is
+  /// opt-out, not opt-in, matching every existing seeded user's behavior.
+  allowGlobalLogin  Boolean  @default(true) @map("allow_global_login")
+  /// Overrides the default JWT session length (auth.routes.ts login) for
+  /// just this user, in minutes - e.g. a shared kiosk/POS login you want to
+  /// expire fast. Null means "use the server default (JWT_EXPIRES_IN)".
+  sessionTimeoutMinutes Int? @map("session_timeout_minutes")
   lastLoginAt       DateTime? @map("last_login_at")
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
@@ -614,6 +632,14 @@ model UserRole {
   userId    String   @map("user_id")
   roleId    String   @map("role_id")
   companyId String?  @map("company_id")
+  /// Null = no start restriction (active immediately/always, matching every
+  /// assignment created before this feature existed).
+  effectiveFrom DateTime? @map("effective_from")
+  /// Null = no end date (never expires). When set, auth.routes.ts login
+  /// excludes this assignment's role/permissions once today's date is past
+  /// it - lets a temporary/contractor grant expire on its own without
+  /// anyone remembering to come back and revoke it by hand.
+  effectiveTill DateTime? @map("effective_till")
 
   tenant    Tenant   @relation(fields: [tenantId], references: [id])
   user      User     @relation(fields: [userId], references: [id])

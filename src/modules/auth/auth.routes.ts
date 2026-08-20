@@ -75,10 +75,19 @@ router.post(
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) throw ApiError.unauthorized("Invalid credentials");
 
-    const userRoles = await prisma.userRole.findMany({
-      where: { tenantId, userId: user.id },
-      include: { role: { include: { rolePermissions: { include: { permission: true } } } } },
-    });
+    // Effective-dated role assignments (Users screen's "Effective from/till"
+    // on each role grant): a row with a future effectiveFrom or a past
+    // effectiveTill contributes no roles/permissions/company access until
+    // (or after) that window, without anyone having to remember to revoke
+    // it by hand. Rows with either date left blank are unrestricted on that
+    // side, matching every assignment created before this feature existed.
+    const now = new Date();
+    const userRoles = (
+      await prisma.userRole.findMany({
+        where: { tenantId, userId: user.id },
+        include: { role: { include: { rolePermissions: { include: { permission: true } } } } },
+      })
+    ).filter((ur) => (!ur.effectiveFrom || ur.effectiveFrom <= now) && (!ur.effectiveTill || ur.effectiveTill >= now));
 
     const roles = [...new Set(userRoles.map((ur) => ur.role.code))];
     const permissions = [
@@ -94,10 +103,17 @@ router.post(
     const secret = process.env.JWT_SECRET;
     if (!secret) throw new Error("JWT_SECRET is not configured");
 
+    // Per-user override (Users screen's "Session timeout (minutes)") wins
+    // over the server-wide default - e.g. a shared kiosk/POS login you want
+    // to expire faster than the normal 8h session.
+    const expiresIn = user.sessionTimeoutMinutes
+      ? `${user.sessionTimeoutMinutes}m`
+      : (process.env.JWT_EXPIRES_IN as any) ?? "8h";
+
     const token = jwt.sign(
       { userId: user.id, tenantId, email: user.email, roles, permissions },
       secret,
-      { expiresIn: (process.env.JWT_EXPIRES_IN as any) ?? "8h" }
+      { expiresIn }
     );
 
     await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
@@ -139,7 +155,19 @@ router.post(
     // Material Request need it client-side too, e.g. to only attempt an
     // Inventory.StockBalance.View call for users who'd actually be allowed to
     // see it, rather than firing a request that's just going to 403.
-    res.json({ token, user: { id: user.id, email: user.email, displayName: user.displayName, roles, permissions, branches, companies } });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.displayName,
+        roles,
+        permissions,
+        branches,
+        companies,
+        allowGlobalLogin: user.allowGlobalLogin,
+      },
+    });
   })
 );
 

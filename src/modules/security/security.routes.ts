@@ -21,10 +21,14 @@ userRouter.get(
       where: { tenantId },
       select: {
         id: true,
+        code: true,
         email: true,
         mobile: true,
         displayName: true,
+        description: true,
         status: true,
+        allowGlobalLogin: true,
+        sessionTimeoutMinutes: true,
         lastLoginAt: true,
         createdAt: true,
         userRoles: { include: { role: true } },
@@ -41,26 +45,61 @@ userRouter.post(
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
     const schema = z.object({
+      code: z.string().optional(),
       email: z.string().email(),
       displayName: z.string().min(1),
       mobile: z.string().optional(),
+      description: z.string().optional(),
       password: z.string().min(8),
       linkedEmployeeId: z.string().uuid().optional(),
+      allowGlobalLogin: z.boolean().optional(),
+      sessionTimeoutMinutes: z.number().int().positive().optional(),
     });
     const payload = schema.parse(req.body);
     const passwordHash = await bcrypt.hash(payload.password, 10);
     const user = await prisma.user.create({
       data: {
         tenantId,
+        code: payload.code,
         email: payload.email,
         displayName: payload.displayName,
         mobile: payload.mobile,
+        description: payload.description,
         linkedEmployeeId: payload.linkedEmployeeId,
+        allowGlobalLogin: payload.allowGlobalLogin,
+        sessionTimeoutMinutes: payload.sessionTimeoutMinutes,
         passwordHash,
         status: "Invited",
       },
     });
     res.status(201).json({ id: user.id, email: user.email, status: user.status });
+  })
+);
+
+// General field edits (name/contact/preferences/status) - separate from
+// password, which only ever changes via the dedicated reset-password route
+// below so a stray blank "password" field in an edit form can never
+// accidentally wipe someone's login.
+userRouter.put(
+  "/:id",
+  requirePermission("Security.Users.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      code: z.string().optional(),
+      email: z.string().email().optional(),
+      displayName: z.string().min(1).optional(),
+      mobile: z.string().optional(),
+      description: z.string().optional(),
+      status: z.enum(["Invited", "Active", "Locked", "Inactive"]).optional(),
+      allowGlobalLogin: z.boolean().optional(),
+      sessionTimeoutMinutes: z.number().int().positive().nullable().optional(),
+    });
+    const payload = schema.parse(req.body);
+    const existing = await prisma.user.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const user = await prisma.user.update({ where: { id: req.params.id }, data: payload });
+    res.json({ id: user.id, email: user.email, status: user.status });
   })
 );
 
@@ -75,6 +114,49 @@ userRouter.post(
     if (!existing) throw ApiError.notFound();
     const user = await prisma.user.update({ where: { id: req.params.id }, data: { status } });
     res.json({ id: user.id, status: user.status });
+  })
+);
+
+// CrudTable's generic Enable/Disable button (see CrudTable.tsx's
+// handleToggleStatus) always calls .../activate or .../deactivate - these
+// give Users the same one-click convenience as every other master screen,
+// on top of (not instead of) the full 4-state dropdown via PUT above.
+userRouter.post(
+  "/:id/activate",
+  requirePermission("Security.Users.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.user.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const user = await prisma.user.update({ where: { id: req.params.id }, data: { status: "Active" } });
+    res.json({ id: user.id, status: user.status });
+  })
+);
+
+userRouter.post(
+  "/:id/deactivate",
+  requirePermission("Security.Users.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.user.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const user = await prisma.user.update({ where: { id: req.params.id }, data: { status: "Inactive" } });
+    res.json({ id: user.id, status: user.status });
+  })
+);
+
+userRouter.post(
+  "/:id/reset-password",
+  requirePermission("Security.Users.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ password: z.string().min(8) });
+    const { password } = schema.parse(req.body);
+    const existing = await prisma.user.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    const passwordHash = await bcrypt.hash(password, 10);
+    await prisma.user.update({ where: { id: req.params.id }, data: { passwordHash } });
+    res.json({ id: existing.id, ok: true });
   })
 );
 
@@ -137,6 +219,22 @@ router.get(
 );
 
 // --- User <-> Role assignment -------------------------------------------
+router.get(
+  "/user-roles",
+  requirePermission("Security.UserRole.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const userId = req.query.userId as string | undefined;
+    if (!userId) throw ApiError.badRequest("userId query param is required");
+    const rows = await prisma.userRole.findMany({
+      where: { tenantId, userId },
+      include: { role: true },
+      orderBy: { id: "asc" },
+    });
+    res.json({ data: rows });
+  })
+);
+
 router.post(
   "/user-roles",
   requirePermission("Security.UserRole.Edit"),
@@ -146,6 +244,8 @@ router.post(
       userId: z.string().uuid(),
       roleId: z.string().uuid(),
       companyId: z.string().uuid().optional(),
+      effectiveFrom: z.coerce.date().optional(),
+      effectiveTill: z.coerce.date().optional(),
     });
     const payload = schema.parse(req.body);
     const record = await prisma.userRole.create({ data: { ...payload, tenantId } });
@@ -166,6 +266,22 @@ router.delete(
 );
 
 // --- Branch / Warehouse access scoping -----------------------------------
+router.get(
+  "/branch-access",
+  requirePermission("Security.BranchAccess.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const userId = req.query.userId as string | undefined;
+    if (!userId) throw ApiError.badRequest("userId query param is required");
+    const rows = await prisma.userBranchAccess.findMany({
+      where: { tenantId, userId },
+      include: { branch: { select: { id: true, code: true, name: true, companyId: true } } },
+      orderBy: { id: "asc" },
+    });
+    res.json({ data: rows });
+  })
+);
+
 router.post(
   "/branch-access",
   requirePermission("Security.BranchAccess.Edit"),
@@ -178,6 +294,34 @@ router.post(
   })
 );
 
+router.delete(
+  "/branch-access/:id",
+  requirePermission("Security.BranchAccess.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.userBranchAccess.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    await prisma.userBranchAccess.delete({ where: { id: req.params.id } });
+    res.status(204).send();
+  })
+);
+
+router.get(
+  "/warehouse-access",
+  requirePermission("Security.WarehouseAccess.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const userId = req.query.userId as string | undefined;
+    if (!userId) throw ApiError.badRequest("userId query param is required");
+    const rows = await prisma.userWarehouseAccess.findMany({
+      where: { tenantId, userId },
+      include: { warehouse: { select: { id: true, code: true, name: true, branchId: true } } },
+      orderBy: { id: "asc" },
+    });
+    res.json({ data: rows });
+  })
+);
+
 router.post(
   "/warehouse-access",
   requirePermission("Security.WarehouseAccess.Edit"),
@@ -187,6 +331,18 @@ router.post(
     const payload = schema.parse(req.body);
     const record = await prisma.userWarehouseAccess.create({ data: { ...payload, tenantId } });
     res.status(201).json(record);
+  })
+);
+
+router.delete(
+  "/warehouse-access/:id",
+  requirePermission("Security.WarehouseAccess.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.userWarehouseAccess.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    await prisma.userWarehouseAccess.delete({ where: { id: req.params.id } });
+    res.status(204).send();
   })
 );
 
