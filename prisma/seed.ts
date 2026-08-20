@@ -468,6 +468,9 @@ async function main() {
     { moduleCode: "Sales.Customer", name: "VAT Certificate", expiryRequired: true },
     { moduleCode: "Sales.Customer", name: "Credit Agreement" },
     { moduleCode: "Sales.Customer", name: "Other" },
+    { moduleCode: "Procurement.MaterialRequest", name: "Quotation" },
+    { moduleCode: "Procurement.MaterialRequest", name: "Specification" },
+    { moduleCode: "Procurement.MaterialRequest", name: "Other" },
   ];
   for (const dt of documentTypeSeed) {
     await prisma.documentType.upsert({

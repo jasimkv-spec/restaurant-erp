@@ -115,7 +115,12 @@ router.get(
     if (req.query.status) where.status = req.query.status;
     const items = await prisma.materialRequest.findMany({
       where,
-      include: { lines: true, branch: true },
+      include: {
+        lines: true,
+        branch: true,
+        requester: { select: { id: true, displayName: true, email: true } },
+        approvedBy: { select: { id: true, displayName: true, email: true } },
+      },
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
@@ -129,7 +134,12 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.materialRequest.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: { include: { baseUom: true } }, uom: true } }, branch: true },
+      include: {
+        lines: { include: { item: { include: { baseUom: true } }, uom: true } },
+        branch: true,
+        requester: { select: { id: true, displayName: true, email: true } },
+        approvedBy: { select: { id: true, displayName: true, email: true } },
+      },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
@@ -323,10 +333,23 @@ router.post(
           data: {}, // no-op; approvedQty left null means "approved as requested" by convention
         });
       }
-      await tx.materialRequest.update({ where: { id: existing.id }, data: { status: "Approved" } });
+      // Taken from the authenticated caller, not the request body - who
+      // approved a document should always be whoever actually clicked
+      // Approve, never something the client can supply itself.
+      await tx.materialRequest.update({
+        where: { id: existing.id },
+        data: { status: "Approved", approvedById: req.user?.userId },
+      });
     });
 
-    const record = await prisma.materialRequest.findUnique({ where: { id: existing.id }, include: { lines: true } });
+    const record = await prisma.materialRequest.findUnique({
+      where: { id: existing.id },
+      include: {
+        lines: true,
+        requester: { select: { id: true, displayName: true, email: true } },
+        approvedBy: { select: { id: true, displayName: true, email: true } },
+      },
+    });
     await writeAuditLog(prisma, {
       tenantId,
       userId: req.user?.userId,
