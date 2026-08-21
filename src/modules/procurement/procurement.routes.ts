@@ -559,7 +559,7 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.mrConsolidation.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: true, mr: { include: { branch: true } } } } },
+      include: { lines: { include: { item: true, mrLine: { include: { uom: true } }, mr: { include: { branch: true } } } } },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
@@ -651,6 +651,75 @@ router.post(
     });
 
     res.status(201).json({ consolidationId: consolidation.id, stockTransfers: createdTransfers });
+  })
+);
+
+/**
+ * Converts an External-fulfillment consolidation into a single RFQ, ready
+ * to send out for vendor quotes. All consolidation lines become RFQ lines
+ * in one RFQ regardless of how many branches originally contributed -
+ * sending several vendors one combined quantity is the whole point of
+ * consolidating in the first place. Each RFQ line keeps sourceMrLineId so
+ * the originating branch/MR is still traceable end to end. Once quotes come
+ * in, the existing RFQ -> PO flow (see /rfqs/:id/select and
+ * /rfqs/:id/convert-to-po below) takes it the rest of the way - no separate
+ * "convert straight to PO" path, since skipping the quote step defeats the
+ * purpose of consolidating multiple branches' demand before buying.
+ */
+router.post(
+  "/mr-consolidations/:id/convert-to-rfq",
+  requirePermission("Procurement.MrConsolidation.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({
+      companyId: z.string().uuid(),
+      branchId: z.string().uuid().optional(),
+      notes: z.string().optional(),
+    });
+    const payload = schema.parse(req.body);
+
+    const consolidation = await prisma.mrConsolidation.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { lines: { include: { mrLine: true } } },
+    });
+    if (!consolidation) throw ApiError.notFound();
+    if (consolidation.fulfillmentType !== "External") {
+      throw ApiError.badRequest("This consolidation is marked Internal - convert it via Transfer instead");
+    }
+    if (consolidation.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot convert a consolidation in status ${consolidation.status}`);
+    }
+
+    const record = await prisma.$transaction(async (tx) => {
+      const rfqNo = await nextDocumentNumber(tx, {
+        tenantId,
+        companyId: payload.companyId,
+        moduleCode: "Rfq",
+        defaultPrefix: "RFQ",
+      });
+      const rfq = await tx.rfq.create({
+        data: {
+          tenantId,
+          rfqNo,
+          branchId: payload.branchId,
+          notes: payload.notes,
+          lines: {
+            create: consolidation.lines.map((l) => ({
+              tenantId,
+              itemId: l.itemId,
+              qty: l.qty,
+              uomId: l.mrLine.uomId,
+              sourceMrLineId: l.mrLineId,
+            })),
+          },
+        },
+        include: { lines: true },
+      });
+      await tx.mrConsolidation.update({ where: { id: consolidation.id }, data: { status: "Converted" } });
+      return rfq;
+    });
+
+    res.status(201).json({ consolidationId: consolidation.id, rfq: record });
   })
 );
 
