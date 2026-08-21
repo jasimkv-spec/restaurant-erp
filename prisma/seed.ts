@@ -656,11 +656,12 @@ async function main() {
     });
   }
 
-  await prisma.itemCategory.upsert({
-    where: { tenantId_code: { tenantId: tenant.id, code: "ASSET-CAT" } },
-    update: {},
-    create: { tenantId: tenant.id, code: "ASSET-CAT", name: "Fixed Assets & Equipment" },
-  });
+  // Fixed assets deliberately do NOT get an Item Category - equipment,
+  // furniture, and similar capitalized purchases need depreciation
+  // schedules and an asset lifecycle that Item Master has no fields for.
+  // They belong in a dedicated Fixed Asset Register module (backlog),
+  // matching SAP's separate Asset Accounting (FI-AA) vs Materials
+  // Management (MM) split - not a category on the product master.
 
   const tomato = await prisma.item.upsert({
     where: { tenantId_code: { tenantId: tenant.id, code: "RM-TOMATO" } },

@@ -174,7 +174,9 @@ router.post(
       await upsertCategory(c[0], c[1], { parentId: menu.id });
     }
 
-    await upsertCategory("ASSET-CAT", "Fixed Assets & Equipment");
+    // Fixed assets deliberately excluded - they belong in a dedicated Fixed
+    // Asset Register (depreciation schedules, asset lifecycle), not Item
+    // Master/Item Categories. See seed.ts for the same note.
 
     const all = await prisma.itemCategory.findMany({ where: { tenantId }, include: { parent: true } });
     res.json({ data: all });
