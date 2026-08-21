@@ -183,6 +183,58 @@ router.post(
   })
 );
 
+// --- Menu Categories - self-referencing tree, Menu Master's own
+// serving/POS hierarchy (Soups, Drinks > Hot > Coffee/Tea), deliberately
+// separate from Item Category (which carries GL mapping, irrelevant to
+// menu layout) and from Group/Subgroup/Family (Raw Material/Item Master's
+// purchasing-side grouping - a different audience) -------------------------
+router.use(
+  "/menu-categories",
+  crudRouter(prisma.menuCategory, {
+    permissionKey: "Inventory.MenuCategory",
+    createSchema: z.object({
+      parentId: z.string().uuid().optional(),
+      code: z.string().min(1).max(30),
+      name: z.string().min(1),
+    }),
+    include: { parent: true },
+  })
+);
+
+// One-click starter set, same idea as Item Categories' - a typical
+// restaurant menu layout to start from and edit freely, not a fixed list.
+router.post(
+  "/menu-categories/load-starter-set",
+  requirePermission("Inventory.MenuCategory.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+
+    const upsertMenuCategory = (code: string, name: string, parentId?: string) =>
+      prisma.menuCategory.upsert({
+        where: { tenantId_code: { tenantId, code } },
+        update: {},
+        create: { tenantId, code, name, parentId },
+      });
+
+    await upsertMenuCategory("STARTERS", "Appetizers / Starters");
+    await upsertMenuCategory("SOUPS", "Soups");
+
+    const mains = await upsertMenuCategory("MAINS", "Main Course");
+    await upsertMenuCategory("MAINS-RICE", "Rice & Biryani", mains.id);
+    await upsertMenuCategory("MAINS-CURRY", "Curries", mains.id);
+
+    await upsertMenuCategory("BREADS", "Breads");
+    await upsertMenuCategory("DESSERTS", "Desserts");
+
+    const drinks = await upsertMenuCategory("DRINKS", "Drinks");
+    await upsertMenuCategory("DRINKS-HOT", "Hot Beverages", drinks.id);
+    await upsertMenuCategory("DRINKS-COLD", "Cold Beverages", drinks.id);
+
+    const all = await prisma.menuCategory.findMany({ where: { tenantId }, include: { parent: true } });
+    res.json({ data: all });
+  })
+);
+
 // --- Items (item / product master) -----------------------------------------------------------
 // Raw Materials Master, Menu Master, and Item Master are all this same
 // table (see the listFilters below), so a single static autoCode series
@@ -244,6 +296,7 @@ router.use(
       familyId: z.string().uuid().optional(),
       brandId: z.string().uuid().optional(),
       itemTypeId: z.string().uuid().optional(),
+      menuCategoryId: z.string().uuid().optional(),
       isSerialized: z.boolean().default(false),
       baseUomId: z.string().uuid(),
       purchaseUomId: z.string().uuid().optional(),
@@ -265,7 +318,7 @@ router.use(
     include: {
       category: true, group: true, subgroup: true, family: true, brand: true,
       baseUom: true, purchaseUom: true, salesUom: true, defaultTax: true, glMapping: true,
-      itemTypeMaster: true,
+      itemTypeMaster: true, menuCategory: true,
     },
     sensitiveFields: {
       fields: ["standardCost", "lastReceivedCost", "averageCost"],

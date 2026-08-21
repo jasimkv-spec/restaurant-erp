@@ -90,6 +90,7 @@ model Tenant {
   // --- Inventory ---
   itemCategories       ItemCategory[]
   itemTypes            ItemType[]
+  menuCategories       MenuCategory[]
   items                Item[]
   serialNumbers        SerialNumber[]
   itemGlMappings       ItemGlMapping[]
@@ -1065,6 +1066,32 @@ model ItemCategory {
   @@map("item_categories")
 }
 
+/// Menu Master's own classification tree - a restaurant serving/POS
+/// hierarchy (Soups, Drinks > Hot > Coffee/Tea, Drinks > Cold > Juices),
+/// self-referencing like ItemCategory so it supports either a flat
+/// category or nested ones. Deliberately separate from ItemCategory (which
+/// carries GL mapping - irrelevant to how a menu is organized) and from
+/// ProductGroup/Subgroup/Family (which is Raw Material/Item Master's own
+/// purchasing-side grouping, a different audience) - reusing either would
+/// mix unrelated pick-lists together.
+model MenuCategory {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  parentId  String?  @map("parent_id")
+  code      String
+  name      String
+  status    String   @default("Active")
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id])
+  parent    MenuCategory?  @relation("MenuCategoryParent", fields: [parentId], references: [id])
+  children  MenuCategory[] @relation("MenuCategoryParent")
+  items     Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("menu_categories")
+}
+
 model Item {
   id              String   @id @default(uuid())
   tenantId        String   @map("tenant_id")
@@ -1094,6 +1121,15 @@ model Item {
   /// See ItemType model. Raw Materials Master defaults new records to the
   /// seeded "Stock" row; Menu Master and Item Master can pick any row too.
   itemTypeId      String?  @map("item_type_id")
+  /// Menu Master-only classification - a restaurant POS/serving hierarchy
+  /// (Soups > Chicken Soup, Drinks > Hot > Coffee/Tea, Drinks > Cold >
+  /// Juices), deliberately separate from ProductGroup/Subgroup/Family above
+  /// (those are for Raw Material/Item Master's purchasing-side grouping,
+  /// e.g. "Dairy" or "Cleaning Supplies" - a different audience and
+  /// purpose, so kept as a different list rather than reusing one). See
+  /// MenuCategory model - self-referencing like ItemCategory, so it
+  /// supports either a flat "Soups" or a nested "Drinks > Hot > Coffee".
+  menuCategoryId  String?  @map("menu_category_id")
   /// Item Master-only concept: when true, purchase/sale of this item will
   /// (once GRN/Sales Invoice exist) prompt for individual serial numbers
   /// rather than just a quantity - see SerialNumber model.
@@ -1132,6 +1168,7 @@ model Item {
   salesUom        Uom?         @relation("ItemSalesUom", fields: [salesUomId], references: [id])
   defaultTax      Tax?         @relation(fields: [defaultTaxId], references: [id])
   itemTypeMaster  ItemType?    @relation(fields: [itemTypeId], references: [id])
+  menuCategory    MenuCategory? @relation(fields: [menuCategoryId], references: [id])
 
   glMapping           ItemGlMapping?
   prices               ItemPrice[]
