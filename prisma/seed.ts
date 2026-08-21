@@ -323,7 +323,8 @@ async function main() {
     "Procurement.MaterialRequest.Submit", "Procurement.MaterialRequest.View",
     "Procurement.MrConsolidation.Create", "Procurement.MrConsolidation.View",
     "Procurement.PurchaseInvoice.Create", "Procurement.PurchaseInvoice.Post", "Procurement.PurchaseInvoice.View",
-    "Procurement.PurchaseOrder.Approve", "Procurement.PurchaseOrder.Create", "Procurement.PurchaseOrder.Submit", "Procurement.PurchaseOrder.View",
+    "Procurement.PurchaseOrder.Approve", "Procurement.PurchaseOrder.Create", "Procurement.PurchaseOrder.Edit",
+    "Procurement.PurchaseOrder.Submit", "Procurement.PurchaseOrder.View",
     "Procurement.Rfq.Approve", "Procurement.Rfq.Create", "Procurement.Rfq.Edit", "Procurement.Rfq.Submit", "Procurement.Rfq.View",
     "Procurement.VendorDebitNote.View", "Procurement.Vendor.ViewBankDetails",
     "Procurement.VendorPayment.Create", "Procurement.VendorPayment.Post", "Procurement.VendorPayment.View",
@@ -376,7 +377,7 @@ async function main() {
   await grantByPrefix(tenantAdminRole.id, [""]);
   await grantByPrefix(storeKeeperRole.id, [
     "Inventory.", "Procurement.MaterialRequest.", "Procurement.MrConsolidation.", "Procurement.Grn.",
-    "Procurement.Rfq.", "Procurement.GoodsReturn.", "Procurement.Reports.View",
+    "Procurement.Rfq.", "Procurement.PurchaseOrder.", "Procurement.GoodsReturn.", "Procurement.Reports.View",
   ]);
   await grantByPrefix(kitchenManagerRole.id, [
     "Recipe.", "Inventory.Item.View", "Inventory.ItemCategory.View", "Consumption.",

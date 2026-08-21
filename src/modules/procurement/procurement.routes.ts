@@ -942,6 +942,7 @@ router.post(
       companyId: z.string().uuid(),
       vendorId: z.string().uuid(),
       branchId: z.string().uuid(),
+      poDate: z.coerce.date().optional(),
       lines: z.array(poLineSchema).min(1),
     });
     const payload = schema.parse(req.body);
@@ -960,6 +961,7 @@ router.post(
           poNo,
           vendorId: payload.vendorId,
           branchId: payload.branchId,
+          ...(payload.poDate ? { poDate: payload.poDate } : {}),
           totalAmount,
           lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
         },
@@ -979,7 +981,11 @@ router.get(
     const where: Record<string, unknown> = { tenantId };
     if (req.query.status) where.status = req.query.status;
     if (req.query.vendorId) where.vendorId = req.query.vendorId;
-    const items = await prisma.purchaseOrder.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    const items = await prisma.purchaseOrder.findMany({
+      where,
+      include: { lines: true, vendor: true, branch: true },
+      orderBy: { createdAt: "desc" },
+    });
     res.json({ data: items });
   })
 );
@@ -991,10 +997,99 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.purchaseOrder.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: true, uom: true, tax: true } }, grns: true },
+      include: { lines: { include: { item: true, uom: true, tax: true } }, vendor: true, branch: true, grns: true },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
+  })
+);
+
+router.put(
+  "/purchase-orders/:id",
+  requirePermission("Procurement.PurchaseOrder.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot edit a PO in status ${existing.status} - only Draft POs can be edited`);
+    }
+
+    const schema = z.object({
+      vendorId: z.string().uuid(),
+      branchId: z.string().uuid(),
+      poDate: z.coerce.date().optional(),
+      lines: z.array(poLineSchema).min(1),
+    });
+    const payload = schema.parse(req.body);
+    const totalAmount = payload.lines.reduce((sum, l) => sum + l.qty * l.unitPrice, 0);
+
+    const record = await prisma.$transaction(async (tx) => {
+      // Same replace-the-set approach as Material Request edit: safe here
+      // because a Draft PO's lines can't yet be referenced by a GRN.
+      await tx.purchaseOrderLine.deleteMany({ where: { poId: existing.id } });
+      return tx.purchaseOrder.update({
+        where: { id: existing.id },
+        data: {
+          vendorId: payload.vendorId,
+          branchId: payload.branchId,
+          ...(payload.poDate ? { poDate: payload.poDate } : {}),
+          totalAmount,
+          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+        },
+        include: { lines: true },
+      });
+    });
+
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordTable: "purchase_orders",
+      recordId: record.id,
+      action: "Edited",
+      oldValue: existing,
+      newValue: payload,
+    });
+
+    res.json(record);
+  })
+);
+
+router.delete(
+  "/purchase-orders/:id",
+  requirePermission("Procurement.PurchaseOrder.Edit"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot delete a PO in status ${existing.status} - only Draft POs can be deleted`);
+    }
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.purchaseOrderLine.deleteMany({ where: { poId: existing.id } });
+        await tx.purchaseOrder.delete({ where: { id: existing.id } });
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2003" || err.code === "P2014")) {
+        throw ApiError.badRequest("This purchase order is referenced elsewhere and can't be deleted.");
+      }
+      throw err;
+    }
+
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordTable: "purchase_orders",
+      recordId: req.params.id,
+      action: "Deleted",
+      oldValue: existing,
+    });
+
+    res.status(204).send();
   })
 );
 
