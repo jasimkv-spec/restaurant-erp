@@ -111,6 +111,76 @@ router.use(
   })
 );
 
+// One-click starter set for a fresh tenant/company - the same restaurant
+// food-cost breakdown recommended when Item Categories were introduced
+// (Raw Materials split by Food/Beverage, Packaging, Consumables, Menu,
+// Fixed Assets). Idempotent (upsert on code), safe to click more than once
+// or after already customizing some categories by hand.
+router.post(
+  "/item-categories/load-starter-set",
+  requirePermission("Inventory.ItemCategory.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ companyId: z.string().uuid() });
+    const { companyId } = schema.parse(req.body);
+
+    const inventoryGl = await resolveCoaByCode(prisma, tenantId, companyId, "INVENTORY-CONTROL");
+    const cogsGl = await resolveCoaByCode(prisma, tenantId, companyId, "COGS-CONTROL");
+
+    const upsertCategory = (code: string, name: string, opts: { parentId?: string; withGl?: boolean } = {}) =>
+      prisma.itemCategory.upsert({
+        where: { tenantId_code: { tenantId, code } },
+        update: {},
+        create: {
+          tenantId,
+          code,
+          name,
+          parentId: opts.parentId,
+          defaultInventoryGlId: opts.withGl ? inventoryGl?.id : undefined,
+          defaultCogsGlId: opts.withGl ? cogsGl?.id : undefined,
+        },
+      });
+
+    const food = await upsertCategory("RAW", "Raw Materials - Food", { withGl: true });
+    for (const c of [
+      ["RAW-VEG", "Vegetables & Fruits"],
+      ["RAW-MEAT", "Meat & Poultry"],
+      ["RAW-SEA", "Seafood"],
+      ["RAW-DAIRY", "Dairy & Eggs"],
+      ["RAW-GROC", "Grocery & Dry Goods"],
+      ["RAW-BAKE", "Bakery Ingredients"],
+    ]) {
+      await upsertCategory(c[0], c[1], { parentId: food.id, withGl: true });
+    }
+
+    const beverage = await upsertCategory("BEV", "Raw Materials - Beverage", { withGl: true });
+    for (const c of [
+      ["BEV-SOFT", "Soft Drinks & Juices"],
+      ["BEV-HOT", "Tea & Coffee"],
+      ["BEV-ALC", "Alcoholic Beverages"],
+    ]) {
+      await upsertCategory(c[0], c[1], { parentId: beverage.id, withGl: true });
+    }
+
+    await upsertCategory("PACK", "Packaging & Disposables", { withGl: true });
+    await upsertCategory("CONSUM", "Consumables (Cleaning & Kitchen Supplies)");
+
+    const menu = await upsertCategory("MENU", "Menu / Finished Goods");
+    for (const c of [
+      ["MENU-FOOD", "Food Items"],
+      ["MENU-BEV", "Beverage Items"],
+      ["MENU-COMBO", "Combo / Meal Items"],
+    ]) {
+      await upsertCategory(c[0], c[1], { parentId: menu.id });
+    }
+
+    await upsertCategory("ASSET-CAT", "Fixed Assets & Equipment");
+
+    const all = await prisma.itemCategory.findMany({ where: { tenantId }, include: { parent: true } });
+    res.json({ data: all });
+  })
+);
+
 // --- Items (item / product master) -----------------------------------------------------------
 // Raw Materials Master, Menu Master, and Item Master are all this same
 // table (see the listFilters below), so a single static autoCode series
