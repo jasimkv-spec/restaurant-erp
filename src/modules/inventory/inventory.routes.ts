@@ -79,6 +79,21 @@ router.get(
   })
 );
 
+// --- Item Types (separate axis from Item.itemType, which only routes a
+// product to the Raw Material/Menu/Item screen - this is the "how is it
+// physically handled" master, selectable from all three screens) ----------
+router.use(
+  "/item-types",
+  crudRouter(prisma.itemType, {
+    permissionKey: "Inventory.ItemType",
+    createSchema: z.object({
+      code: z.string().min(1).max(30),
+      name: z.string().min(1),
+      isStock: z.boolean().default(false),
+    }),
+  })
+);
+
 // --- Item Categories (legacy self-referencing tree, still supported
 // alongside Group/Subgroup/Family for GL defaulting) -----------------------
 router.use(
@@ -156,6 +171,8 @@ router.use(
       subgroupId: z.string().uuid().optional(),
       familyId: z.string().uuid().optional(),
       brandId: z.string().uuid().optional(),
+      itemTypeId: z.string().uuid().optional(),
+      isSerialized: z.boolean().default(false),
       baseUomId: z.string().uuid(),
       purchaseUomId: z.string().uuid().optional(),
       salesUomId: z.string().uuid().optional(),
@@ -176,6 +193,7 @@ router.use(
     include: {
       category: true, group: true, subgroup: true, family: true, brand: true,
       baseUom: true, purchaseUom: true, salesUom: true, defaultTax: true, glMapping: true,
+      itemTypeMaster: true,
     },
     sensitiveFields: {
       fields: ["standardCost", "lastReceivedCost", "averageCost"],
@@ -183,8 +201,10 @@ router.use(
     },
     // Lets Raw Materials Master / Menu Master / Item Master each show a
     // pre-filtered slice of this same table via ?itemType=a,b,c - see
-    // pages/products/ProductItemsView.tsx on the frontend.
-    listFilters: ["itemType"],
+    // pages/products/ProductItemsView.tsx on the frontend. The six for*
+    // flags let any screen further narrow to just what's relevant to it -
+    // e.g. Material Request's item picker only wants forPurchase=true.
+    listFilters: ["itemType", "forSales", "forManufacture", "forFactory", "forPurchase", "forPos", "forExpense"],
   })
 );
 

@@ -89,7 +89,9 @@ model Tenant {
 
   // --- Inventory ---
   itemCategories       ItemCategory[]
+  itemTypes            ItemType[]
   items                Item[]
+  serialNumbers        SerialNumber[]
   itemGlMappings       ItemGlMapping[]
   itemPrices           ItemPrice[]
   itemVendorMappings   ItemVendorMapping[]
@@ -1086,6 +1088,16 @@ model Item {
   subgroupId      String?  @map("subgroup_id")
   familyId        String?  @map("family_id")
   brandId         String?  @map("brand_id")
+  /// Separate axis from itemType above (which just routes a product to the
+  /// Raw Material/Menu/Item screen) - a manageable master list of how this
+  /// product should be handled physically (Stock/Non-Stock/Service/...).
+  /// See ItemType model. Raw Materials Master defaults new records to the
+  /// seeded "Stock" row; Menu Master and Item Master can pick any row too.
+  itemTypeId      String?  @map("item_type_id")
+  /// Item Master-only concept: when true, purchase/sale of this item will
+  /// (once GRN/Sales Invoice exist) prompt for individual serial numbers
+  /// rather than just a quantity - see SerialNumber model.
+  isSerialized    Boolean  @default(false) @map("is_serialized")
   baseUomId       String   @map("base_uom_id")
   purchaseUomId   String?  @map("purchase_uom_id") // UOM used on purchase orders, if different from base
   salesUomId      String?  @map("sales_uom_id")    // UOM used on sales/POS, if different from base
@@ -1119,6 +1131,7 @@ model Item {
   purchaseUom     Uom?         @relation("ItemPurchaseUom", fields: [purchaseUomId], references: [id])
   salesUom        Uom?         @relation("ItemSalesUom", fields: [salesUomId], references: [id])
   defaultTax      Tax?         @relation(fields: [defaultTaxId], references: [id])
+  itemTypeMaster  ItemType?    @relation(fields: [itemTypeId], references: [id])
 
   glMapping           ItemGlMapping?
   prices               ItemPrice[]
@@ -1145,9 +1158,52 @@ model Item {
   deliveryOrderLines    DeliveryOrderLine[]
   salesReturnLines      SalesReturnLine[]
   productionPostingLines ProductionPostingLine[]
+  serialNumbers         SerialNumber[]
   @@unique([tenantId, code])
   @@index([tenantId])
   @@map("items")
+}
+
+/// The "physically how does this get handled" master - separate from
+/// Item.itemType (which only routes a product to the Raw Material/Menu/Item
+/// screen). Selectable from all three of those screens equally. isStock
+/// drives sensible defaults (Raw Materials Master pre-selects the seeded
+/// "Stock" row) but nothing currently reads it as an enforcement rule -
+/// stock ledger posting still keys off the existing itemType/recipe logic.
+model ItemType {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  code     String
+  name     String
+  isStock  Boolean @default(false) @map("is_stock")
+  status   String  @default("Active")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  items  Item[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("item_types")
+}
+
+/// Individual serial numbers for an Item.isSerialized item. Not yet written
+/// to by any transaction (GRN/Sales Invoice don't exist yet) - this is
+/// groundwork so the column/table shape exists ahead of time; status will
+/// track In Stock/Sold/Returned once those screens post to it.
+model SerialNumber {
+  id       String   @id @default(uuid())
+  tenantId String   @map("tenant_id")
+  itemId   String   @map("item_id")
+  serialNo String   @map("serial_no")
+  status   String   @default("Available") // Available|Sold|Returned
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  item   Item   @relation(fields: [itemId], references: [id])
+
+  @@unique([tenantId, itemId, serialNo])
+  @@index([tenantId])
+  @@map("serial_numbers")
 }
 
 model ItemGlMapping {

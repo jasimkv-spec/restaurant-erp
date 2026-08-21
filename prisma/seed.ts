@@ -285,7 +285,7 @@ async function main() {
     "Admin.FinancialPeriod", "Admin.MasterSeries", "Admin.ProfitCentre", "Admin.Warehouse",
     "Finance.AccountGroup", "Finance.BankAccount", "Finance.ChartOfAccount",
     "Inventory.Item", "Inventory.ItemCategory", "Inventory.ItemPrice", "Inventory.ItemVendorMapping",
-    "Inventory.ItemBranchSetting",
+    "Inventory.ItemBranchSetting", "Inventory.ItemType",
     "Inventory.ProductGroup", "Inventory.ProductSubgroup", "Inventory.ProductFamily", "Inventory.Brand",
     "Inventory.PriceGroup",
     "Masters.Area", "Masters.PaymentMethod", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
@@ -515,6 +515,36 @@ async function main() {
     create: { tenantId: tenant.id, code: "NET30", name: "Net 30 Days", days: 30 },
   });
 
+  // Item Type master (separate axis from itemType above, which only routes
+  // a product to the Raw Material/Menu/Item screen) - Raw Materials Master
+  // pre-selects "STOCK" for every new record; the rest are just a starting
+  // point the user can extend from the Item Types screen.
+  const itemTypeStock = await prisma.itemType.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "STOCK" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "STOCK", name: "Stock", isStock: true },
+  });
+  await prisma.itemType.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "NONSTOCK" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "NONSTOCK", name: "Non-Stock", isStock: false },
+  });
+  await prisma.itemType.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "SERVICE" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "SERVICE", name: "Service", isStock: false },
+  });
+  await prisma.itemType.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "CONSUMABLE" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "CONSUMABLE", name: "Consumable", isStock: true },
+  });
+  await prisma.itemType.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "ASSET" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "ASSET", name: "Fixed Asset", isStock: false },
+  });
+
   const category = await prisma.itemCategory.upsert({
     where: { tenantId_code: { tenantId: tenant.id, code: "RAW" } },
     update: {},
@@ -535,6 +565,8 @@ async function main() {
       code: "RM-TOMATO",
       name: "Tomato",
       itemType: "Stock",
+      itemTypeId: itemTypeStock.id,
+      forPurchase: true,
       categoryId: category.id,
       baseUomId: uomKg.id,
       costingMethod: "Weighted Average",
@@ -560,6 +592,8 @@ async function main() {
       code: "RM-BUN",
       name: "Burger Bun",
       itemType: "Stock",
+      itemTypeId: itemTypeStock.id,
+      forPurchase: true,
       categoryId: category.id,
       baseUomId: uomPc.id,
       costingMethod: "Weighted Average",

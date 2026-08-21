@@ -125,8 +125,16 @@ export function crudRouter(delegate: Delegate, opts: CrudOptions): Router {
       for (const field of opts.listFilters ?? []) {
         const raw = req.query[field];
         if (typeof raw === "string" && raw.length > 0) {
-          const values = raw.split(",");
-          where[field] = values.length > 1 ? { in: values } : values[0];
+          // A literal "true"/"false" means this is a boolean column (e.g.
+          // Item.forPurchase) - Prisma rejects a raw string there, so coerce
+          // it. Anything else (a code, an id, a comma list) is left as
+          // string/"in" matching, same as before.
+          if (raw === "true" || raw === "false") {
+            where[field] = raw === "true";
+          } else {
+            const values = raw.split(",");
+            where[field] = values.length > 1 ? { in: values } : values[0];
+          }
         }
       }
 
