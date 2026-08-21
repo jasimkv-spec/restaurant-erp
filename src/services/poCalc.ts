@@ -23,6 +23,10 @@ export interface PoLineComputed extends PoLineInput {
   isFocLine: boolean;
   taxAmount: number;
   lineTotal: number;
+  // This line's share of the header-level discount, prorated by its share of
+  // the pre-header-discount subtotal. Kept separate from the line's own
+  // discountPct/discountAmount (its independently negotiated discount).
+  headerDiscountShare: number;
 }
 
 export interface PoTotals {
@@ -78,6 +82,7 @@ export async function computePoLineAmounts(
       isFocLine: l.isFocLine ?? false,
       taxAmount,
       lineTotal,
+      headerDiscountShare: headerShare,
     };
   });
 

@@ -331,7 +331,10 @@ router.get(
       where: { id: req.params.id, tenantId },
       include: {
         lines: { include: { item: { include: { baseUom: true } }, uom: true } },
-        branch: true,
+        // Nested company - the print letterhead (logo, legal name, address,
+        // tax/registration no., transaction header/footer text) reads from
+        // record.branch.company. See DocumentScreen.printRecord.
+        branch: { include: { company: true } },
         requester: { select: { id: true, displayName: true, email: true } },
         approvedBy: { select: { id: true, displayName: true, email: true } },
       },
@@ -1124,7 +1127,9 @@ router.get(
       include: {
         lines: { include: { item: true, uom: true, tax: true } },
         vendor: true,
-        branch: true,
+        // Nested company for the print letterhead - see the same comment on
+        // GET /material-requests/:id above.
+        branch: { include: { company: true } },
         grns: true,
         currency: true,
         paymentTerms: true,

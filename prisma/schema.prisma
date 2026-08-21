@@ -1890,6 +1890,12 @@ model PurchaseOrderLine {
   // Computed and stored at save time by poCalc.ts - never hand-entered.
   taxAmount      Decimal  @default(0) @db.Decimal(18, 3) @map("tax_amount")
   lineTotal      Decimal  @default(0) @db.Decimal(18, 3) @map("line_total")
+  // This line's proportional share of the PO header's discountPct/discountAmount,
+  // allocated by the line's share of the pre-header-discount subtotal. Kept
+  // separate from discountPct/discountAmount above (this line's own negotiated
+  // discount) so both figures stay visible - the header share matters for
+  // GRN/ledger costing later on. Computed and stored at save time by poCalc.ts.
+  headerDiscountShare Decimal @default(0) @db.Decimal(18, 3) @map("header_discount_share")
   sourceMrId     String?  @map("source_mr_id")
   sourceMrLineId String?  @map("source_mr_line_id")
   sourceRfqLineId String? @map("source_rfq_line_id")
