@@ -551,10 +551,115 @@ async function main() {
     create: {
       tenantId: tenant.id,
       code: "RAW",
-      name: "Raw Materials",
+      name: "Raw Materials - Food",
       defaultInventoryGlId: coa["INVENTORY-CONTROL"],
       defaultCogsGlId: coa["COGS-CONTROL"],
     },
+  });
+
+  // A starter Item Category tree, structured the way a restaurant P&L
+  // usually wants its food/COGS split: each of these can carry its own
+  // Inventory/COGS account so items just pick a category and inherit the
+  // right posting (per-item overrides still take priority - see
+  // resolveItemGl() in coaLookup.ts). Group/Subgroup/Family stay purely
+  // organizational (no GL) since that's not what they're used for.
+  const foodChildren = [
+    { code: "RAW-VEG", name: "Vegetables & Fruits" },
+    { code: "RAW-MEAT", name: "Meat & Poultry" },
+    { code: "RAW-SEA", name: "Seafood" },
+    { code: "RAW-DAIRY", name: "Dairy & Eggs" },
+    { code: "RAW-GROC", name: "Grocery & Dry Goods" },
+    { code: "RAW-BAKE", name: "Bakery Ingredients" },
+  ];
+  for (const c of foodChildren) {
+    await prisma.itemCategory.upsert({
+      where: { tenantId_code: { tenantId: tenant.id, code: c.code } },
+      update: {},
+      create: {
+        tenantId: tenant.id,
+        code: c.code,
+        name: c.name,
+        parentId: category.id,
+        defaultInventoryGlId: coa["INVENTORY-CONTROL"],
+        defaultCogsGlId: coa["COGS-CONTROL"],
+      },
+    });
+  }
+
+  const beverageCategory = await prisma.itemCategory.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "BEV" } },
+    update: {},
+    create: {
+      tenantId: tenant.id,
+      code: "BEV",
+      name: "Raw Materials - Beverage",
+      defaultInventoryGlId: coa["INVENTORY-CONTROL"],
+      defaultCogsGlId: coa["COGS-CONTROL"],
+    },
+  });
+  const beverageChildren = [
+    { code: "BEV-SOFT", name: "Soft Drinks & Juices" },
+    { code: "BEV-HOT", name: "Tea & Coffee" },
+    { code: "BEV-ALC", name: "Alcoholic Beverages" },
+  ];
+  for (const c of beverageChildren) {
+    await prisma.itemCategory.upsert({
+      where: { tenantId_code: { tenantId: tenant.id, code: c.code } },
+      update: {},
+      create: {
+        tenantId: tenant.id,
+        code: c.code,
+        name: c.name,
+        parentId: beverageCategory.id,
+        defaultInventoryGlId: coa["INVENTORY-CONTROL"],
+        defaultCogsGlId: coa["COGS-CONTROL"],
+      },
+    });
+  }
+
+  await prisma.itemCategory.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "PACK" } },
+    update: {},
+    create: {
+      tenantId: tenant.id,
+      code: "PACK",
+      name: "Packaging & Disposables",
+      defaultInventoryGlId: coa["INVENTORY-CONTROL"],
+      defaultCogsGlId: coa["COGS-CONTROL"],
+    },
+  });
+  await prisma.itemCategory.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "CONSUM" } },
+    update: {},
+    create: {
+      tenantId: tenant.id,
+      code: "CONSUM",
+      name: "Consumables (Cleaning & Kitchen Supplies)",
+    },
+  });
+
+  const menuCategory = await prisma.itemCategory.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "MENU" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "MENU", name: "Menu / Finished Goods" },
+  });
+  const menuChildren = [
+    { code: "MENU-FOOD", name: "Food Items" },
+    { code: "MENU-BEV", name: "Beverage Items" },
+    { code: "MENU-COMBO", name: "Combo / Meal Items" },
+  ];
+  for (const c of menuChildren) {
+    await prisma.itemCategory.upsert({
+      where: { tenantId_code: { tenantId: tenant.id, code: c.code } },
+      update: {},
+      create: { tenantId: tenant.id, code: c.code, name: c.name, parentId: menuCategory.id },
+    });
+  }
+
+  await prisma.itemCategory.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: "ASSET-CAT" } },
+    update: {},
+    create: { tenantId: tenant.id, code: "ASSET-CAT", name: "Fixed Assets & Equipment" },
   });
 
   const tomato = await prisma.item.upsert({

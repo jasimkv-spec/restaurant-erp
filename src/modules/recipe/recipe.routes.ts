@@ -7,7 +7,7 @@ import { ApiError } from "../../utils/errors";
 import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
 import { postJournal, recordPostingException } from "../../services/journalService";
-import { resolveCoaByCode } from "../../services/coaLookup";
+import { resolveItemGl } from "../../services/coaLookup";
 import { explodeRecipeVersion } from "../../services/recipeExplosion";
 
 const router = Router();
@@ -369,7 +369,10 @@ router.post(
 
     const posting = await prisma.productionPosting.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: true, recipeVersion: { include: { recipe: { include: { outputItem: { include: { category: true } } } } } } },
+      include: {
+        lines: true,
+        recipeVersion: { include: { recipe: { include: { outputItem: { include: { category: true, glMapping: true } } } } } },
+      },
     });
     if (!posting) throw ApiError.notFound();
     if (posting.status !== "Draft") throw ApiError.badRequest(`Production posting already ${posting.status}`);
@@ -395,11 +398,11 @@ router.post(
           data: { unitCost: result.unitCostApplied, totalCost: lineCost },
         });
 
-        const ingredientItem = await tx.item.findUnique({ where: { id: line.ingredientItemId }, include: { category: true } });
-        const ingredientGl =
-          (ingredientItem?.category?.defaultInventoryGlId &&
-            (await tx.chartOfAccount.findUnique({ where: { id: ingredientItem.category.defaultInventoryGlId } }))) ||
-          (await resolveCoaByCode(tx, tenantId, companyId, "INVENTORY-CONTROL"));
+        const ingredientItem = await tx.item.findUnique({
+          where: { id: line.ingredientItemId },
+          include: { category: true, glMapping: true },
+        });
+        const ingredientGl = await resolveItemGl(tx, tenantId, companyId, ingredientItem, "inventoryGlId", "INVENTORY-CONTROL");
         if (ingredientGl) {
           glTotals.set(ingredientGl.id, (glTotals.get(ingredientGl.id) ?? 0) + lineCost);
         }
@@ -420,10 +423,14 @@ router.post(
       await tx.productionPosting.update({ where: { id: posting.id }, data: { status: "Posted", totalCost } });
 
       if (totalCost > 0 && glTotals.size > 0) {
-        const outputGl =
-          (posting.recipeVersion.recipe.outputItem.category?.defaultInventoryGlId &&
-            (await tx.chartOfAccount.findUnique({ where: { id: posting.recipeVersion.recipe.outputItem.category.defaultInventoryGlId } }))) ||
-          (await resolveCoaByCode(tx, tenantId, companyId, "INVENTORY-CONTROL"));
+        const outputGl = await resolveItemGl(
+          tx,
+          tenantId,
+          companyId,
+          posting.recipeVersion.recipe.outputItem,
+          "inventoryGlId",
+          "INVENTORY-CONTROL"
+        );
         if (outputGl) {
           const lines = [
             { accountId: outputGl.id, debit: totalCost },
