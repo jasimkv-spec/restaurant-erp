@@ -779,7 +779,7 @@ router.get(
     const tenantId = req.tenant!.id;
     const where: Record<string, unknown> = { tenantId };
     if (req.query.status) where.status = req.query.status;
-    const items = await prisma.rfq.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    const items = await prisma.rfq.findMany({ where, include: { lines: true, branch: true }, orderBy: { createdAt: "desc" } });
     res.json({ data: items });
   })
 );
