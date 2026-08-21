@@ -288,7 +288,7 @@ async function main() {
     "Inventory.ItemBranchSetting", "Inventory.ItemType", "Inventory.MenuCategory",
     "Inventory.ProductGroup", "Inventory.ProductSubgroup", "Inventory.ProductFamily", "Inventory.Brand",
     "Inventory.PriceGroup",
-    "Masters.Area", "Masters.PaymentMethod", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
+    "Masters.Area", "Masters.PaymentMethod", "Masters.ShipmentType", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
     "Procurement.Vendor",
     "Sales.Customer", "Sales.PosConnector", "Sales.PosItemMapping", "Sales.SalesChannel",
     "Security.Role",

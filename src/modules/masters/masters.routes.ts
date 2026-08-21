@@ -318,4 +318,16 @@ router.use(
   })
 );
 
+// --- Shipment Types (Purchase Order header field: Road/Air/Sea/Any) ---------
+router.use(
+  "/shipment-types",
+  crudRouter(prisma.shipmentType, {
+    permissionKey: "Masters.ShipmentType",
+    createSchema: z.object({
+      code: z.string().min(1).max(20),
+      name: z.string().min(1),
+    }),
+  })
+);
+
 export default router;

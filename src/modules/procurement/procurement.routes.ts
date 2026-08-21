@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
-import { requirePermission } from "../../middleware/rbac";
+import { requirePermission, hasPermission } from "../../middleware/rbac";
 import { ApiError } from "../../utils/errors";
 import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
@@ -14,6 +14,7 @@ import { triggerApproval } from "../../services/approvalService";
 import { writeAuditLog } from "../../services/auditService";
 import { resolvePolicy } from "../../services/policyRuleService";
 import { resolveUomQty } from "../../utils/uomConversion";
+import { computePoLineAmounts } from "../../services/poCalc";
 
 const router = Router();
 
@@ -251,6 +252,73 @@ router.get(
     }
 
     res.json({ data: Array.from(byItem.values()) });
+  })
+);
+
+/**
+ * Pool of Approved MR lines available for direct pull into a new Purchase
+ * Order (task: "Option to retrieve MR from approved MR list for direct PO
+ * creation"). Deliberately a separate, flatter shape than
+ * consolidation-pool above (one row per MR line, not grouped by item)
+ * since a PO-creation picker wants to show "which MR/branch is this qty
+ * from" per row, not an aggregated total.
+ *
+ * Excludes a line if it's already sitting in a live (non-Cancelled) MR
+ * Consolidation (same exclusion consolidation-pool uses - once a line is
+ * pooled for RFQ sourcing it shouldn't also be picked straight into a PO)
+ * or if it's already been pulled into any Purchase Order line via
+ * sourceMrLineId, so the same demand can't be double-ordered.
+ *
+ * Registered ahead of GET /material-requests/:id for the same route-
+ * ordering reason as check-duplicate/consolidation-pool above.
+ */
+router.get(
+  "/material-requests/po-pool",
+  requirePermission("Procurement.PurchaseOrder.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const status = typeof req.query.status === "string" ? req.query.status : "Approved";
+
+    const [consolidated, alreadyOnPo] = await Promise.all([
+      prisma.mrConsolidationLine.findMany({
+        where: { tenantId, consolidation: { status: { not: "Cancelled" } } },
+        select: { mrLineId: true },
+      }),
+      prisma.purchaseOrderLine.findMany({
+        where: { tenantId, sourceMrLineId: { not: null } },
+        select: { sourceMrLineId: true },
+      }),
+    ]);
+    const excludeLineIds = [
+      ...consolidated.map((l) => l.mrLineId),
+      ...alreadyOnPo.map((l) => l.sourceMrLineId as string),
+    ];
+
+    const lines = await prisma.materialRequestLine.findMany({
+      where: {
+        tenantId,
+        id: { notIn: excludeLineIds },
+        mr: { status, OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }] },
+      },
+      include: { item: true, uom: true, mr: { include: { branch: true } } },
+      orderBy: { mr: { requestDate: "asc" } },
+    });
+
+    const data = lines.map((line) => ({
+      mrLineId: line.id,
+      mrId: line.mrId,
+      mrNo: line.mr.mrNo,
+      branchId: line.mr.branchId,
+      branchName: line.mr.branch.name,
+      itemId: line.itemId,
+      itemCode: line.item.code,
+      itemName: line.item.name,
+      uomId: line.uomId,
+      uomCode: line.uom.code,
+      qty: Number(line.approvedQty ?? line.requestedQty),
+    }));
+
+    res.json({ data });
   })
 );
 
@@ -898,18 +966,32 @@ router.post(
     const createdPOs = await prisma.$transaction(async (tx) => {
       const pos: any[] = [];
       for (const [vendorId, lines] of byVendor) {
-        const poLines = lines.map((line) => ({
-          tenantId,
+        const poLineInputs = lines.map((line) => ({
           itemId: line.itemId,
-          qty: line.qty,
+          qty: Number(line.qty),
           uomId: line.uomId,
-          unitPrice: line.quotes[0].quotedPrice,
+          unitPrice: Number(line.quotes[0].quotedPrice),
           sourceRfqLineId: line.id,
         }));
-        const totalAmount = poLines.reduce((sum, l) => sum + Number(l.qty) * Number(l.unitPrice), 0);
+        // RFQ-derived POs default to Vatable with no header discount - the
+        // per-line tax still comes through if a line has its own taxId;
+        // see computePoLineAmounts for the shared math with manual POs.
+        const { lines: computedLines, totalAmount } = await computePoLineAmounts(
+          tx,
+          tenantId,
+          { taxMode: "Vatable" },
+          poLineInputs
+        );
         const poNo = await nextDocumentNumber(tx, { tenantId, companyId, moduleCode: "PurchaseOrder", defaultPrefix: "PO" });
         const po = await tx.purchaseOrder.create({
-          data: { tenantId, poNo, vendorId, branchId, totalAmount, lines: { create: poLines } },
+          data: {
+            tenantId,
+            poNo,
+            vendorId,
+            branchId,
+            totalAmount,
+            lines: { create: computedLines.map((l) => ({ ...l, tenantId })) },
+          },
           include: { lines: true },
         });
         pos.push(po);
@@ -929,8 +1011,34 @@ const poLineSchema = z.object({
   uomId: z.string().uuid(),
   unitPrice: z.number().nonnegative(),
   taxId: z.string().uuid().optional(),
+  discountPct: z.number().min(0).max(100).optional(),
+  discountAmount: z.number().nonnegative().optional(),
+  focQty: z.number().nonnegative().default(0),
+  // Accepts either a real boolean or the "true"/"false" string a plain HTML
+  // <select> sends, since the frontend's generic line-field renderer only
+  // knows text/number/select/date inputs (see DocFieldConfig) - there's no
+  // dedicated checkbox type, so this is modeled there as a Yes/No select.
+  isFocLine: z.preprocess((v) => v === true || v === "true", z.boolean()).default(false),
+  instructions: z.string().optional(),
   sourceMrId: z.string().uuid().optional(),
   sourceMrLineId: z.string().uuid().optional(),
+});
+
+// Shared header field set for both create and edit - every new field the
+// user asked for on the PO header, all optional so existing behavior
+// (a bare vendor/branch/lines PO) still works unchanged.
+const poHeaderSchema = z.object({
+  taxMode: z.enum(["Vatable", "Exempt"]).default("Vatable"),
+  currencyId: z.string().uuid().optional(),
+  exchangeRate: z.number().positive().default(1),
+  discountPct: z.number().min(0).max(100).optional(),
+  discountAmount: z.number().nonnegative().optional(),
+  paymentTermsId: z.string().uuid().optional(),
+  deliveryInstructions: z.string().optional(),
+  requiredDate: z.coerce.date().optional(),
+  validityDate: z.coerce.date().optional(),
+  shipmentTypeId: z.string().uuid().optional(),
+  shippingTerms: z.string().optional(),
 });
 
 router.post(
@@ -938,7 +1046,7 @@ router.post(
   requirePermission("Procurement.PurchaseOrder.Create"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({
+    const schema = poHeaderSchema.extend({
       companyId: z.string().uuid(),
       vendorId: z.string().uuid(),
       branchId: z.string().uuid(),
@@ -946,7 +1054,12 @@ router.post(
       lines: z.array(poLineSchema).min(1),
     });
     const payload = schema.parse(req.body);
-    const totalAmount = payload.lines.reduce((sum, l) => sum + l.qty * l.unitPrice, 0);
+    const { lines: computedLines, totalAmount } = await computePoLineAmounts(
+      prisma,
+      tenantId,
+      { taxMode: payload.taxMode, discountPct: payload.discountPct, discountAmount: payload.discountAmount },
+      payload.lines
+    );
 
     const record = await prisma.$transaction(async (tx) => {
       const poNo = await nextDocumentNumber(tx, {
@@ -962,8 +1075,19 @@ router.post(
           vendorId: payload.vendorId,
           branchId: payload.branchId,
           ...(payload.poDate ? { poDate: payload.poDate } : {}),
+          taxMode: payload.taxMode,
+          currencyId: payload.currencyId,
+          exchangeRate: payload.exchangeRate,
+          discountPct: payload.discountPct,
+          discountAmount: payload.discountAmount,
+          paymentTermsId: payload.paymentTermsId,
+          deliveryInstructions: payload.deliveryInstructions,
+          requiredDate: payload.requiredDate,
+          validityDate: payload.validityDate,
+          shipmentTypeId: payload.shipmentTypeId,
+          shippingTerms: payload.shippingTerms,
           totalAmount,
-          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+          lines: { create: computedLines.map((l) => ({ ...l, tenantId })) },
         },
         include: { lines: true },
       });
@@ -983,7 +1107,7 @@ router.get(
     if (req.query.vendorId) where.vendorId = req.query.vendorId;
     const items = await prisma.purchaseOrder.findMany({
       where,
-      include: { lines: true, vendor: true, branch: true },
+      include: { lines: true, vendor: true, branch: true, currency: true, paymentTerms: true, shipmentType: true },
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
@@ -997,7 +1121,15 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.purchaseOrder.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: true, uom: true, tax: true } }, vendor: true, branch: true, grns: true },
+      include: {
+        lines: { include: { item: true, uom: true, tax: true } },
+        vendor: true,
+        branch: true,
+        grns: true,
+        currency: true,
+        paymentTerms: true,
+        shipmentType: true,
+      },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
@@ -1015,14 +1147,19 @@ router.put(
       throw ApiError.badRequest(`Cannot edit a PO in status ${existing.status} - only Draft POs can be edited`);
     }
 
-    const schema = z.object({
+    const schema = poHeaderSchema.extend({
       vendorId: z.string().uuid(),
       branchId: z.string().uuid(),
       poDate: z.coerce.date().optional(),
       lines: z.array(poLineSchema).min(1),
     });
     const payload = schema.parse(req.body);
-    const totalAmount = payload.lines.reduce((sum, l) => sum + l.qty * l.unitPrice, 0);
+    const { lines: computedLines, totalAmount } = await computePoLineAmounts(
+      prisma,
+      tenantId,
+      { taxMode: payload.taxMode, discountPct: payload.discountPct, discountAmount: payload.discountAmount },
+      payload.lines
+    );
 
     const record = await prisma.$transaction(async (tx) => {
       // Same replace-the-set approach as Material Request edit: safe here
@@ -1034,8 +1171,19 @@ router.put(
           vendorId: payload.vendorId,
           branchId: payload.branchId,
           ...(payload.poDate ? { poDate: payload.poDate } : {}),
+          taxMode: payload.taxMode,
+          currencyId: payload.currencyId,
+          exchangeRate: payload.exchangeRate,
+          discountPct: payload.discountPct,
+          discountAmount: payload.discountAmount,
+          paymentTermsId: payload.paymentTermsId,
+          deliveryInstructions: payload.deliveryInstructions,
+          requiredDate: payload.requiredDate,
+          validityDate: payload.validityDate,
+          shipmentTypeId: payload.shipmentTypeId,
+          shippingTerms: payload.shippingTerms,
           totalAmount,
-          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+          lines: { create: computedLines.map((l) => ({ ...l, tenantId })) },
         },
         include: { lines: true },
       });
@@ -1142,6 +1290,43 @@ router.post(
   })
 );
 
+/**
+ * Extends (or otherwise updates) a PO's validity date after the fact.
+ * Distinct from the normal Draft-only PUT /purchase-orders/:id edit route
+ * because validity legitimately needs adjusting on POs that are already
+ * Submitted/Approved - gated behind the Approve permission rather than Edit
+ * so it's the same "authorized user" tier the user asked for.
+ */
+router.post(
+  "/purchase-orders/:id/extend-validity",
+  requirePermission("Procurement.PurchaseOrder.Approve"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const schema = z.object({ validityDate: z.coerce.date() });
+    const { validityDate } = schema.parse(req.body);
+    const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status === "Cancelled") {
+      throw ApiError.badRequest("Cannot change the validity date of a Cancelled purchase order");
+    }
+    const record = await prisma.purchaseOrder.update({
+      where: { id: existing.id },
+      data: { validityDate },
+    });
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.PurchaseOrder",
+      recordTable: "purchase_orders",
+      recordId: record.id,
+      action: "ValidityExtended",
+      oldValue: { validityDate: existing.validityDate },
+      newValue: { validityDate },
+    });
+    res.json(record);
+  })
+);
+
 // --- GRN (Goods Receipt Note) ------------------------------------------------
 const grnLineSchema = z.object({
   poLineId: z.string().uuid().optional(),
@@ -1172,6 +1357,20 @@ router.post(
     for (const l of payload.lines) {
       if (l.acceptedQty + l.rejectedQty > l.receivedQty + 1e-9) {
         throw ApiError.badRequest("accepted + rejected quantity cannot exceed received quantity", l);
+      }
+    }
+
+    if (payload.poId) {
+      const po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId } });
+      if (!po) throw ApiError.badRequest("poId not found");
+      const expired = po.validityDate && po.validityDate.getTime() < Date.now();
+      // An authorized user (Approve permission) can still push a GRN through
+      // on an expired PO by first calling extend-validity - this check just
+      // stops it happening silently for everyone else.
+      if (expired && !hasPermission(req, "Procurement.PurchaseOrder.Approve")) {
+        throw ApiError.badRequest(
+          `This purchase order's validity date has passed (${po.validityDate!.toISOString().slice(0, 10)}) - ask an authorized user to extend it before receiving against it.`
+        );
       }
     }
 

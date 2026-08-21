@@ -78,6 +78,7 @@ model Tenant {
   uomConversions    UomConversion[]
   terms             Term[]
   paymentMethods    PaymentMethod[]
+  shipmentTypes     ShipmentType[]
 
   // --- Product classification ---
   productGroups     ProductGroup[]
@@ -776,9 +777,10 @@ model Currency {
   // where that rate gets frozen in.
   exchangeRate     Decimal @default(1) @db.Decimal(18, 6) @map("exchange_rate")
 
-  vendors   Vendor[]
-  customers Customer[]
-  companies Company[]
+  vendors        Vendor[]
+  customers      Customer[]
+  companies      Company[]
+  purchaseOrders PurchaseOrder[]
 
   @@map("currencies")
 }
@@ -893,9 +895,10 @@ model Term {
   days     Int    @default(0)
   status   String @default("Active")
 
-  tenant    Tenant     @relation(fields: [tenantId], references: [id])
-  vendors   Vendor[]
-  customers Customer[]
+  tenant         Tenant     @relation(fields: [tenantId], references: [id])
+  vendors        Vendor[]
+  customers      Customer[]
+  purchaseOrders PurchaseOrder[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -918,6 +921,24 @@ model PaymentMethod {
   @@unique([tenantId, code])
   @@index([tenantId])
   @@map("payment_methods")
+}
+
+/// Mode of transport for an inbound shipment (Road/Air/Sea/Any, or whatever
+/// a tenant adds) - purely a Purchase Order header field for now, e.g. to
+/// print on the PO or filter procurement reports later.
+model ShipmentType {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  code     String
+  name     String
+  status   String @default("Active")
+
+  tenant         Tenant           @relation(fields: [tenantId], references: [id])
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("shipment_types")
 }
 
 /// Global reference list of banks (e.g. "Emirates NBD"), same idea as
@@ -1797,6 +1818,33 @@ model PurchaseOrder {
   poDate         DateTime @default(now()) @map("po_date")
   status         String   @default("Draft") // Draft|Submitted|Approved|Partially Received|Closed|Cancelled
   approvalStatus String   @default("Pending") @map("approval_status")
+  // Vatable = every line calculates tax from its own item/line tax config
+  // (see Item.defaultTaxId and PurchaseOrderLine.taxId). Exempt = the whole
+  // PO is tax-exempt regardless of what any line's tax config says - taxAmount
+  // is forced to 0 on every line when computing totals.
+  taxMode        String   @default("Vatable") @map("tax_mode") // Vatable|Exempt
+  currencyId     String?  @map("currency_id")
+  // Copied from Currency.exchangeRate at the point the PO's currency was
+  // set (defaults from the vendor's own currency) - frozen here so a later
+  // change to that currency's rate doesn't retroactively reprice this PO.
+  exchangeRate   Decimal  @default(1) @db.Decimal(18, 6) @map("exchange_rate")
+  // Header-level discount, entered as either a percentage or a flat amount
+  // (whichever the user filled in - see poCalc.ts for how one derives the
+  // other) and prorated across every line by that line's share of the
+  // subtotal, so each line's own taxAmount/lineTotal already reflects it.
+  discountPct    Decimal? @db.Decimal(9, 4) @map("discount_pct")
+  discountAmount Decimal? @db.Decimal(18, 3) @map("discount_amount")
+  paymentTermsId String?  @map("payment_terms_id")
+  deliveryInstructions String? @map("delivery_instructions")
+  // By when the vendor needs to deliver - distinct from validityDate below.
+  requiredDate   DateTime? @map("required_date")
+  // After this date the PO can no longer receive a GRN against it (see
+  // POST /grns) - an authorized user can push it out via
+  // POST /purchase-orders/:id/extend-validity, which works even once the
+  // PO is past Draft (the normal edit route doesn't).
+  validityDate   DateTime? @map("validity_date")
+  shipmentTypeId String?  @map("shipment_type_id")
+  shippingTerms  String?  @map("shipping_terms")
   totalAmount    Decimal  @default(0) @db.Decimal(18, 3) @map("total_amount")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
@@ -1804,6 +1852,9 @@ model PurchaseOrder {
   tenant         Tenant   @relation(fields: [tenantId], references: [id])
   vendor         Vendor   @relation(fields: [vendorId], references: [id])
   branch         Branch   @relation(fields: [branchId], references: [id])
+  currency       Currency? @relation(fields: [currencyId], references: [id])
+  paymentTerms   Term?    @relation(fields: [paymentTermsId], references: [id])
+  shipmentType   ShipmentType? @relation(fields: [shipmentTypeId], references: [id])
 
   lines          PurchaseOrderLine[]
   grns           Grn[]
@@ -1822,6 +1873,23 @@ model PurchaseOrderLine {
   uomId          String   @map("uom_id")
   unitPrice      Decimal  @db.Decimal(18, 3) @map("unit_price")
   taxId          String?  @map("tax_id")
+  // Negotiated discount on this specific line - independent of (and applied
+  // before) the PO header's own prorated discount. Same either-pct-or-amount
+  // convention as the header fields.
+  discountPct    Decimal? @db.Decimal(9, 4) @map("discount_pct")
+  discountAmount Decimal? @db.Decimal(18, 3) @map("discount_amount")
+  // Extra quantity of this same item the vendor throws in free alongside
+  // the paid qty above (e.g. "100 + 5 free") - tracked for GRN/receiving,
+  // never priced.
+  focQty         Decimal  @default(0) @db.Decimal(18, 3) @map("foc_qty")
+  // A whole separate line that's free of charge (e.g. water bottles bundled
+  // with a vegetable order) - when true, unitPrice is ignored for costing
+  // (treated as 0) regardless of what's stored on it.
+  isFocLine      Boolean  @default(false) @map("is_foc_line")
+  instructions   String?
+  // Computed and stored at save time by poCalc.ts - never hand-entered.
+  taxAmount      Decimal  @default(0) @db.Decimal(18, 3) @map("tax_amount")
+  lineTotal      Decimal  @default(0) @db.Decimal(18, 3) @map("line_total")
   sourceMrId     String?  @map("source_mr_id")
   sourceMrLineId String?  @map("source_mr_line_id")
   sourceRfqLineId String? @map("source_rfq_line_id")
