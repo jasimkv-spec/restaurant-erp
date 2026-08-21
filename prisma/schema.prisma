@@ -1085,7 +1085,11 @@ model MenuCategory {
   tenant    Tenant         @relation(fields: [tenantId], references: [id])
   parent    MenuCategory?  @relation("MenuCategoryParent", fields: [parentId], references: [id])
   children  MenuCategory[] @relation("MenuCategoryParent")
-  items     Item[]
+  /// Split into two named back-relations because Item points at MenuCategory
+  /// twice (its category and, separately, its sub-category) - Prisma needs
+  /// distinct relation names to tell those two FKs apart.
+  itemsAsCategory    Item[] @relation("ItemMenuCategory")
+  itemsAsSubcategory Item[] @relation("ItemMenuSubcategory")
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -1097,6 +1101,9 @@ model Item {
   tenantId        String   @map("tenant_id")
   code            String
   name            String
+  /// Bilingual bill printing - most restaurant POS/invoice rules require
+  /// showing the Arabic name alongside the English one.
+  nameArabic      String?  @map("name_arabic")
   shortName       String?  @map("short_name") // print/receipt name, kept short for POS/kitchen tickets
   barcode         String?
   itemType        String   @map("item_type") // Sellable|Stock|Non-stock|Stationary|Menu|Semi-finished|Finished|Packaging|Service|Spare
@@ -1130,6 +1137,12 @@ model Item {
   /// MenuCategory model - self-referencing like ItemCategory, so it
   /// supports either a flat "Soups" or a nested "Drinks > Hot > Coffee".
   menuCategoryId  String?  @map("menu_category_id")
+  /// Optional second level under menuCategoryId above - e.g. "Hot" or
+  /// "Cold" under a "Drinks" menu category. Deliberately not constrained to
+  /// be an actual child of the chosen menuCategoryId (same as
+  /// Group/Subgroup/Family below aren't constrained to each other either) -
+  /// keeps this simple rather than needing cascading-select logic.
+  menuSubcategoryId String? @map("menu_subcategory_id")
   /// Item Master-only concept: when true, purchase/sale of this item will
   /// (once GRN/Sales Invoice exist) prompt for individual serial numbers
   /// rather than just a quantity - see SerialNumber model.
@@ -1168,7 +1181,8 @@ model Item {
   salesUom        Uom?         @relation("ItemSalesUom", fields: [salesUomId], references: [id])
   defaultTax      Tax?         @relation(fields: [defaultTaxId], references: [id])
   itemTypeMaster  ItemType?    @relation(fields: [itemTypeId], references: [id])
-  menuCategory    MenuCategory? @relation(fields: [menuCategoryId], references: [id])
+  menuCategory    MenuCategory? @relation("ItemMenuCategory", fields: [menuCategoryId], references: [id])
+  menuSubcategory MenuCategory? @relation("ItemMenuSubcategory", fields: [menuSubcategoryId], references: [id])
 
   glMapping           ItemGlMapping?
   prices               ItemPrice[]

@@ -201,40 +201,6 @@ router.use(
   })
 );
 
-// One-click starter set, same idea as Item Categories' - a typical
-// restaurant menu layout to start from and edit freely, not a fixed list.
-router.post(
-  "/menu-categories/load-starter-set",
-  requirePermission("Inventory.MenuCategory.Create"),
-  asyncHandler(async (req, res) => {
-    const tenantId = req.tenant!.id;
-
-    const upsertMenuCategory = (code: string, name: string, parentId?: string) =>
-      prisma.menuCategory.upsert({
-        where: { tenantId_code: { tenantId, code } },
-        update: {},
-        create: { tenantId, code, name, parentId },
-      });
-
-    await upsertMenuCategory("STARTERS", "Appetizers / Starters");
-    await upsertMenuCategory("SOUPS", "Soups");
-
-    const mains = await upsertMenuCategory("MAINS", "Main Course");
-    await upsertMenuCategory("MAINS-RICE", "Rice & Biryani", mains.id);
-    await upsertMenuCategory("MAINS-CURRY", "Curries", mains.id);
-
-    await upsertMenuCategory("BREADS", "Breads");
-    await upsertMenuCategory("DESSERTS", "Desserts");
-
-    const drinks = await upsertMenuCategory("DRINKS", "Drinks");
-    await upsertMenuCategory("DRINKS-HOT", "Hot Beverages", drinks.id);
-    await upsertMenuCategory("DRINKS-COLD", "Cold Beverages", drinks.id);
-
-    const all = await prisma.menuCategory.findMany({ where: { tenantId }, include: { parent: true } });
-    res.json({ data: all });
-  })
-);
-
 // --- Items (item / product master) -----------------------------------------------------------
 // Raw Materials Master, Menu Master, and Item Master are all this same
 // table (see the listFilters below), so a single static autoCode series
@@ -270,6 +236,7 @@ router.use(
     createSchema: z.object({
       code: z.string().min(1).max(50),
       name: z.string().min(1),
+      nameArabic: z.string().optional(),
       itemType: z.enum([
         "Sellable",
         "Stock",
@@ -297,6 +264,7 @@ router.use(
       brandId: z.string().uuid().optional(),
       itemTypeId: z.string().uuid().optional(),
       menuCategoryId: z.string().uuid().optional(),
+      menuSubcategoryId: z.string().uuid().optional(),
       isSerialized: z.boolean().default(false),
       baseUomId: z.string().uuid(),
       purchaseUomId: z.string().uuid().optional(),
@@ -318,7 +286,7 @@ router.use(
     include: {
       category: true, group: true, subgroup: true, family: true, brand: true,
       baseUom: true, purchaseUom: true, salesUom: true, defaultTax: true, glMapping: true,
-      itemTypeMaster: true, menuCategory: true,
+      itemTypeMaster: true, menuCategory: true, menuSubcategory: true,
     },
     sensitiveFields: {
       fields: ["standardCost", "lastReceivedCost", "averageCost"],
