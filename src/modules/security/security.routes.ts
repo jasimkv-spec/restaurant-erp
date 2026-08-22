@@ -29,6 +29,8 @@ userRouter.get(
         status: true,
         allowGlobalLogin: true,
         sessionTimeoutMinutes: true,
+        managerId: true,
+        manager: { select: { id: true, displayName: true, email: true } },
         lastLoginAt: true,
         createdAt: true,
         userRoles: { include: { role: true } },
@@ -54,6 +56,7 @@ userRouter.post(
       linkedEmployeeId: z.string().uuid().optional(),
       allowGlobalLogin: z.boolean().optional(),
       sessionTimeoutMinutes: z.number().int().positive().optional(),
+      managerId: z.string().uuid().optional(),
     });
     const payload = schema.parse(req.body);
     const passwordHash = await bcrypt.hash(payload.password, 10);
@@ -68,6 +71,7 @@ userRouter.post(
         linkedEmployeeId: payload.linkedEmployeeId,
         allowGlobalLogin: payload.allowGlobalLogin,
         sessionTimeoutMinutes: payload.sessionTimeoutMinutes,
+        managerId: payload.managerId,
         passwordHash,
         status: "Invited",
       },
@@ -94,10 +98,14 @@ userRouter.put(
       status: z.enum(["Invited", "Active", "Locked", "Inactive"]).optional(),
       allowGlobalLogin: z.boolean().optional(),
       sessionTimeoutMinutes: z.number().int().positive().nullable().optional(),
+      managerId: z.string().uuid().nullable().optional(),
     });
     const payload = schema.parse(req.body);
     const existing = await prisma.user.findFirst({ where: { id: req.params.id, tenantId } });
     if (!existing) throw ApiError.notFound();
+    if (payload.managerId && payload.managerId === existing.id) {
+      throw ApiError.badRequest("A user can't be their own manager.");
+    }
     const user = await prisma.user.update({ where: { id: req.params.id }, data: payload });
     res.json({ id: user.id, email: user.email, status: user.status });
   })

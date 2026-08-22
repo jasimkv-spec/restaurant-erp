@@ -11,7 +11,7 @@ import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
 import { postJournal, recordPostingException } from "../../services/journalService";
 import { resolveCoaByCode } from "../../services/coaLookup";
-import { triggerApproval } from "../../services/approvalService";
+import { triggerApproval, assertCanApprove } from "../../services/approvalService";
 import { writeAuditLog } from "../../services/auditService";
 import { resolvePolicy } from "../../services/policyRuleService";
 import { resolveUomQty } from "../../utils/uomConversion";
@@ -519,7 +519,6 @@ router.post(
 
 router.post(
   "/material-requests/:id/approve",
-  requirePermission("Procurement.MaterialRequest.Approve"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
     const schema = z.object({
@@ -530,6 +529,13 @@ router.post(
     const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
     if (!existing) throw ApiError.notFound();
     if (existing.status !== "Submitted") throw ApiError.badRequest(`Cannot approve MR in status ${existing.status}`);
+    // Approve permission (role) OR being the requester's own line manager -
+    // see assertCanApprove's doc comment for the full rule.
+    await assertCanApprove(prisma, req, {
+      tenantId,
+      requesterUserId: existing.requesterId,
+      permission: "Procurement.MaterialRequest.Approve",
+    });
 
     await prisma.$transaction(async (tx) => {
       if (lineApprovals) {
@@ -1101,6 +1107,9 @@ router.post(
           shipmentTypeId: payload.shipmentTypeId,
           shippingTerms: payload.shippingTerms,
           totalAmount,
+          // Taken from the authenticated caller, not the request body - see
+          // the same convention/comment on MaterialRequest.requesterId.
+          createdById: req.user?.userId,
           lines: { create: computedLines.map((l) => ({ ...l, tenantId })) },
         },
         include: { lines: true },
@@ -1121,7 +1130,15 @@ router.get(
     if (req.query.vendorId) where.vendorId = req.query.vendorId;
     const items = await prisma.purchaseOrder.findMany({
       where,
-      include: { lines: true, vendor: true, branch: true, currency: true, paymentTerms: true, shipmentType: true },
+      include: {
+        lines: true,
+        vendor: true,
+        branch: true,
+        currency: true,
+        paymentTerms: true,
+        shipmentType: true,
+        createdBy: { select: { id: true, displayName: true, email: true } },
+      },
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
@@ -1145,6 +1162,7 @@ router.get(
         currency: true,
         paymentTerms: true,
         shipmentType: true,
+        createdBy: { select: { id: true, displayName: true, email: true } },
       },
     });
     if (!record) throw ApiError.notFound();
@@ -1285,11 +1303,17 @@ router.post(
 
 router.post(
   "/purchase-orders/:id/approve",
-  requirePermission("Procurement.PurchaseOrder.Approve"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
     const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
     if (!existing) throw ApiError.notFound();
+    // Approve permission (role) OR being the PO creator's own line manager -
+    // see assertCanApprove's doc comment for the full rule.
+    await assertCanApprove(prisma, req, {
+      tenantId,
+      requesterUserId: existing.createdById,
+      permission: "Procurement.PurchaseOrder.Approve",
+    });
     const record = await prisma.purchaseOrder.update({
       where: { id: existing.id },
       data: { status: "Approved", approvalStatus: "Approved" },

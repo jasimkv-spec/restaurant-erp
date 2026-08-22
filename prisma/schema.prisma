@@ -570,11 +570,22 @@ model User {
   /// just this user, in minutes - e.g. a shared kiosk/POS login you want to
   /// expire fast. Null means "use the server default (JWT_EXPIRES_IN)".
   sessionTimeoutMinutes Int? @map("session_timeout_minutes")
+  /// This user's line manager (another User in the same tenant). Used by
+  /// the approval-authority check (see approvalService.ts's
+  /// assertCanApprove): a transaction's approver can be either someone
+  /// holding that module's Approve permission (existing role-based rule)
+  /// OR the requester's direct manager, even if the manager's own role
+  /// doesn't carry the Approve permission. Null means "no manager set" -
+  /// approval then falls back to role-based only, same as before this
+  /// field existed.
+  managerId         String?  @map("manager_id")
   lastLoginAt       DateTime? @map("last_login_at")
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
 
   tenant            Tenant   @relation(fields: [tenantId], references: [id])
+  manager           User?    @relation("UserManager", fields: [managerId], references: [id])
+  directReports     User[]   @relation("UserManager")
   userRoles         UserRole[]
   branchAccess      UserBranchAccess[]
   warehouseAccess   UserWarehouseAccess[]
@@ -584,6 +595,7 @@ model User {
   policyRules       PolicyRule[]
   mrRequested       MaterialRequest[] @relation("MrRequester")
   mrApproved        MaterialRequest[] @relation("MrApprovedBy")
+  poCreated         PurchaseOrder[] @relation("PoCreatedBy")
 
   @@unique([tenantId, email])
   @@index([tenantId])
@@ -1852,6 +1864,12 @@ model PurchaseOrder {
   shipmentTypeId String?  @map("shipment_type_id")
   shippingTerms  String?  @map("shipping_terms")
   totalAmount    Decimal  @default(0) @db.Decimal(18, 3) @map("total_amount")
+  // Taken from the authenticated caller at creation time, same convention
+  // as MaterialRequest.requesterId - never client-supplied. Used by the
+  // approval-authority check (assertCanApprove) to find this PO's
+  // requester's line manager. Null for POs created before this field
+  // existed - those fall back to role-based approval only.
+  createdById    String?  @map("created_by_id")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
 
@@ -1861,6 +1879,7 @@ model PurchaseOrder {
   currency       Currency? @relation(fields: [currencyId], references: [id])
   paymentTerms   Term?    @relation(fields: [paymentTermsId], references: [id])
   shipmentType   ShipmentType? @relation(fields: [shipmentTypeId], references: [id])
+  createdBy      User?    @relation("PoCreatedBy", fields: [createdById], references: [id])
 
   lines          PurchaseOrderLine[]
   grns           Grn[]

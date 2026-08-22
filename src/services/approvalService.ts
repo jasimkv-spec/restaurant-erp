@@ -1,4 +1,7 @@
+import { Request } from "express";
 import { Prisma, PrismaClient } from "@prisma/client";
+import { hasPermission } from "../middleware/rbac";
+import { ApiError } from "../utils/errors";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -130,4 +133,44 @@ export async function advanceApproval(
 
   await createLevelTasks(tx, task.tenantId, workflow.id, task.recordId, levels, nextLevel);
   return { fullyApproved: false };
+}
+
+/**
+ * The single approval-authority rule used by every document's own
+ * `/:id/approve` route (Material Request, Purchase Order, and future GRN).
+ * This is deliberately separate from the ApprovalWorkflow/ApprovalTask
+ * chain above (that engine tracks a parallel notification/sign-off record;
+ * it doesn't gate the document's own status field).
+ *
+ * A caller may approve a document if either is true:
+ *   1. They hold the module's own Approve permission (e.g.
+ *      "Procurement.MaterialRequest.Approve") via their role - this is the
+ *      existing, unchanged rule and by itself already covers a person
+ *      approving their own document or their team's, as long as their role
+ *      carries that permission.
+ *   2. They are the specific requester's line manager (User.managerId),
+ *      even if the manager's own role does not carry the Approve
+ *      permission - lets a plain "Staff" role's manager sign off on their
+ *      direct reports' documents without needing a broader approver role.
+ *
+ * requesterUserId may be null/undefined for legacy records created before
+ * requester/createdBy tracking existed - in that case only rule 1 applies,
+ * matching today's actual behaviour for those records.
+ */
+export async function assertCanApprove(
+  tx: Tx,
+  req: Request,
+  params: { tenantId: string; requesterUserId?: string | null; permission: string }
+) {
+  if (hasPermission(req, params.permission)) return;
+
+  if (params.requesterUserId && req.user) {
+    const requester = await tx.user.findFirst({
+      where: { id: params.requesterUserId, tenantId: params.tenantId },
+      select: { managerId: true },
+    });
+    if (requester?.managerId && requester.managerId === req.user.userId) return;
+  }
+
+  throw ApiError.forbidden(`Missing permission: ${params.permission}`);
 }
