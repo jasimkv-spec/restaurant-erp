@@ -142,35 +142,60 @@ export async function advanceApproval(
  * chain above (that engine tracks a parallel notification/sign-off record;
  * it doesn't gate the document's own status field).
  *
- * A caller may approve a document if either is true:
- *   1. They hold the module's own Approve permission (e.g.
- *      "Procurement.MaterialRequest.Approve") via their role - this is the
- *      existing, unchanged rule and by itself already covers a person
- *      approving their own document or their team's, as long as their role
- *      carries that permission.
- *   2. They are the specific requester's line manager (User.managerId),
- *      even if the manager's own role does not carry the Approve
- *      permission - lets a plain "Staff" role's manager sign off on their
- *      direct reports' documents without needing a broader approver role.
+ * The rule: the caller must hold the module's own Approve permission (e.g.
+ * "Procurement.MaterialRequest.Approve") via their role - roles are scoped
+ * per document type (a role can have Approve on MR + GRN but not PO, or
+ * everything - see Roles screen), that part is unchanged - AND, unless
+ * they're approving their own document, they must be somewhere in the
+ * requester's management chain (the requester's manager, that manager's
+ * manager, and so on - User.managerId).
+ *
+ * This is what makes approval "climb the chain": if a Data Entry user's
+ * direct manager (say, Store In-Charge) doesn't hold the Approve
+ * permission, the Store In-Charge simply can't approve anything (fails the
+ * permission check) - but the Store In-Charge's own manager (say, Area
+ * Manager), if THEY hold the permission, can approve, because they're an
+ * ancestor of the requester too. Nobody needs to explicitly "route" the
+ * approval anywhere; whoever holds the permission and sits above the
+ * requester in the chain is authorized, at whatever level that turns out
+ * to be. Someone who holds the permission but is NOT in this requester's
+ * chain at all (a different team's manager, for instance) cannot approve
+ * this particular document - permission alone is not company-wide.
+ *
+ * SuperAdmin/TenantAdmin bypass everything, same as requirePermission's
+ * own full-access rule.
  *
  * requesterUserId may be null/undefined for legacy records created before
- * requester/createdBy tracking existed - in that case only rule 1 applies,
- * matching today's actual behaviour for those records.
+ * requester/createdBy tracking existed - in that case the permission check
+ * alone decides, matching today's actual behaviour for those records.
  */
 export async function assertCanApprove(
   tx: Tx,
   req: Request,
   params: { tenantId: string; requesterUserId?: string | null; permission: string }
 ) {
-  if (hasPermission(req, params.permission)) return;
+  const user = req.user;
+  if (!user) throw ApiError.unauthorized();
 
-  if (params.requesterUserId && req.user) {
-    const requester = await tx.user.findFirst({
-      where: { id: params.requesterUserId, tenantId: params.tenantId },
-      select: { managerId: true },
-    });
-    if (requester?.managerId && requester.managerId === req.user.userId) return;
+  if (user.roles.includes("SuperAdmin") || user.roles.includes("TenantAdmin")) return;
+
+  if (!hasPermission(req, params.permission)) {
+    throw ApiError.forbidden(`Missing permission: ${params.permission}`);
   }
 
-  throw ApiError.forbidden(`Missing permission: ${params.permission}`);
+  if (!params.requesterUserId || params.requesterUserId === user.userId) return;
+
+  // Climb the requester's manager chain looking for the caller. Capped so
+  // a stray circular manager assignment can't loop forever.
+  let currentId: string | null = params.requesterUserId;
+  for (let i = 0; i < 25 && currentId; i++) {
+    const current = await tx.user.findFirst({
+      where: { id: currentId, tenantId: params.tenantId },
+      select: { managerId: true },
+    });
+    currentId = current?.managerId ?? null;
+    if (currentId === user.userId) return;
+  }
+
+  throw ApiError.forbidden("You can only approve documents raised by yourself or someone in your reporting line.");
 }

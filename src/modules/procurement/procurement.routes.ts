@@ -529,8 +529,8 @@ router.post(
     const existing = await prisma.materialRequest.findFirst({ where: { id: req.params.id, tenantId } });
     if (!existing) throw ApiError.notFound();
     if (existing.status !== "Submitted") throw ApiError.badRequest(`Cannot approve MR in status ${existing.status}`);
-    // Approve permission (role) OR being the requester's own line manager -
-    // see assertCanApprove's doc comment for the full rule.
+    // Must hold the Approve permission AND be the requester (or somewhere
+    // above them in the manager chain) - see assertCanApprove's doc comment.
     await assertCanApprove(prisma, req, {
       tenantId,
       requesterUserId: existing.requesterId,
@@ -1307,8 +1307,8 @@ router.post(
     const tenantId = req.tenant!.id;
     const existing = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, tenantId } });
     if (!existing) throw ApiError.notFound();
-    // Approve permission (role) OR being the PO creator's own line manager -
-    // see assertCanApprove's doc comment for the full rule.
+    // Must hold the Approve permission AND be the PO creator (or somewhere
+    // above them in the manager chain) - see assertCanApprove's doc comment.
     await assertCanApprove(prisma, req, {
       tenantId,
       requesterUserId: existing.createdById,
