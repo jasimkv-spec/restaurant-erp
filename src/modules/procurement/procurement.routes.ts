@@ -1664,6 +1664,35 @@ router.delete(
 );
 
 /**
+ * Whether every line of the given PO has been fully received across all of
+ * its GRNs (Draft or Posted alike - same no-status-filter convention as the
+ * cumulative-received validation on POST /grns). Shared by the pre-check
+ * (decides whether POST /grns/:id/post needs to ask the caller what to do
+ * with the PO) and the actual status write inside that route's own
+ * transaction, so both agree on the same definition of "fully received".
+ */
+async function isPoFullyReceived(tx: Prisma.TransactionClient | typeof prisma, poId: string) {
+  const poLines = await tx.purchaseOrderLine.findMany({ where: { poId } });
+  const grnLines = await tx.grnLine.findMany({ where: { grn: { poId } } });
+  return poLines.every((pl) => {
+    const receivedForLine = grnLines
+      .filter((gl) => gl.poLineId === pl.id)
+      .reduce((s, gl) => s + Number(gl.acceptedQty), 0);
+    return receivedForLine >= Number(pl.qty) - 1e-6;
+  });
+}
+
+const postGrnSchema = z.object({
+  // Only meaningful when this GRN leaves its linked PO partially received.
+  // "close" closes the PO early (no more deliveries expected against it);
+  // "keep-open" leaves it "Partially Received" so a later GRN can still be
+  // raised against the remaining qty. Left undefined on the first attempt -
+  // the route responds 409 asking the caller to choose, then this endpoint
+  // is called again with the choice filled in.
+  poDisposition: z.enum(["close", "keep-open"]).optional(),
+});
+
+/**
  * Posts the GRN: appends stock_ledger rows for each accepted line (weighted
  * average costing), and books a provisional GL entry Dr Inventory Asset /
  * Cr GRN Clearing (accrual) - matching BRD 5.9 "GRN accrual", settled later
@@ -1673,6 +1702,7 @@ router.post(
   "/grns/:id/post",
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
+    const payload = postGrnSchema.parse(req.body ?? {});
 
     const grn = await prisma.grn.findFirst({
       where: { id: req.params.id, tenantId },
@@ -1687,6 +1717,23 @@ router.post(
       requesterUserId: grn.createdById,
       permission: "Procurement.Grn.Post",
     });
+
+    // If this GRN leaves its PO partially received and the caller hasn't
+    // said what to do about it yet, stop here and ask - rather than
+    // silently deciding "Partially Received" on their behalf. A fully
+    // received PO has nothing to decide (always closes), so this only
+    // fires on genuine partial receipts.
+    if (grn.poId && !payload.poDisposition) {
+      const fullyReceived = await isPoFullyReceived(prisma, grn.poId);
+      if (!fullyReceived) {
+        const po = await prisma.purchaseOrder.findUnique({ where: { id: grn.poId }, select: { poNo: true } });
+        throw ApiError.conflict(
+          "This GRN doesn't fully receive its linked Purchase Order. Choose whether to keep the PO open for the remaining items or close it now.",
+          { requiresPoDecision: true, poId: grn.poId, poNo: po?.poNo }
+        );
+      }
+    }
+
     // Resolved from the GRN's own branch rather than requiring the client to
     // send it - the generic lifecycle button (DocumentScreen) posts an empty
     // body, same as every other module's submit/approve action.
@@ -1819,17 +1866,15 @@ router.post(
       await tx.grn.update({ where: { id: grn.id }, data: { status: "Posted", qcStatus: "Accepted" } });
 
       if (grn.poId) {
-        const poLines = await tx.purchaseOrderLine.findMany({ where: { poId: grn.poId } });
-        const grnLines = await tx.grnLine.findMany({ where: { grn: { poId: grn.poId } } });
-        const fullyReceived = poLines.every((pl) => {
-          const receivedForLine = grnLines
-            .filter((gl) => gl.poLineId === pl.id)
-            .reduce((s, gl) => s + Number(gl.acceptedQty), 0);
-          return receivedForLine >= Number(pl.qty) - 1e-6;
-        });
+        const fullyReceived = await isPoFullyReceived(tx, grn.poId);
+        // Fully received always closes, no choice to make. Otherwise honor
+        // the caller's earlier decision (defaults to "keep-open" behavior -
+        // "Partially Received" - if somehow reached without one, e.g. a
+        // fully-received PO that lost a line concurrently).
+        const status = fullyReceived ? "Closed" : payload.poDisposition === "close" ? "Closed" : "Partially Received";
         await tx.purchaseOrder.update({
           where: { id: grn.poId },
-          data: { status: fullyReceived ? "Closed" : "Partially Received" },
+          data: { status },
         });
       }
     });
