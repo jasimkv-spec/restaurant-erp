@@ -1577,7 +1577,7 @@ router.get(
     const record = await prisma.grn.findFirst({
       where: { id: req.params.id, tenantId },
       include: {
-        lines: { include: { item: true, poLine: true } },
+        lines: { include: { item: true, poLine: { include: { tax: true } } } },
         additionalCosts: { include: { costType: true } },
         vendor: true,
         // Nested company for the print letterhead - same as MR/PO's own GET :id.
@@ -2013,11 +2013,13 @@ router.post(
       invoiceReceivedDate: z.coerce.date().optional(),
       gross: z.number().nonnegative(),
       tax: z.number().nonnegative().default(0),
-      // Shaped as DocumentScreen-style "lines" (one row per linked GRN)
-      // rather than a plain grnIds[] array, so the generic transaction
-      // screen component can render/save this the same way as every other
-      // document - each row just needs the grnId, the rest (GRN No.,
-      // value, ...) is display-only, resolved client-side.
+      // Shaped as DocumentScreen-style "lines" rather than a plain grnIds[]
+      // array, so the generic transaction screen component can render/save
+      // this the same way as every other document. The frontend shows one
+      // row per underlying GRN line (item, qty, price, tax, ...) for detail
+      // parity with a PO, but every row from the same GRN carries the same
+      // grnId - only that field is read here, everything else is
+      // display-only and stripped by this schema.
       lines: z.array(z.object({ grnId: z.string().uuid() })).min(1),
       additionalCosts: z.array(additionalCostLineSchema).default([]),
     });
@@ -2042,7 +2044,11 @@ router.post(
         // Taken from the authenticated caller, not the request body - same
         // convention as Grn.createdById / PurchaseOrder.createdById.
         createdById: req.user?.userId,
-        grns: { create: payload.lines.map((l) => ({ tenantId, grnId: l.grnId })) },
+        // The frontend sends one "line" per underlying GRN line (for
+        // item/qty/price/tax detail parity with a PO), so several rows can
+        // share the same grnId - dedupe before creating the bridge, since
+        // the invoice-to-GRN link itself is per-GRN, not per-line.
+        grns: { create: Array.from(new Set(payload.lines.map((l) => l.grnId))).map((grnId) => ({ tenantId, grnId })) },
         additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
       },
       include: {
