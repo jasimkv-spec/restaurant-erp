@@ -289,7 +289,7 @@ async function main() {
     "Inventory.ProductGroup", "Inventory.ProductSubgroup", "Inventory.ProductFamily", "Inventory.Brand",
     "Inventory.PriceGroup",
     "Masters.Area", "Masters.PaymentMethod", "Masters.ShipmentType", "Masters.Tax", "Masters.TaxGroup", "Masters.Term", "Masters.Uom",
-    "Procurement.Vendor",
+    "Procurement.Vendor", "Procurement.AdditionalCostType",
     "Sales.Customer", "Sales.PosConnector", "Sales.PosItemMapping", "Sales.SalesChannel",
     "Security.Role",
     "Workflow.ApprovalWorkflow", "Workflow.DocumentType",
@@ -378,6 +378,7 @@ async function main() {
   await grantByPrefix(storeKeeperRole.id, [
     "Inventory.", "Procurement.MaterialRequest.", "Procurement.MrConsolidation.", "Procurement.Grn.",
     "Procurement.Rfq.", "Procurement.PurchaseOrder.", "Procurement.GoodsReturn.", "Procurement.Reports.View",
+    "Procurement.AdditionalCostType.",
   ]);
   await grantByPrefix(kitchenManagerRole.id, [
     "Recipe.", "Inventory.Item.View", "Inventory.ItemCategory.View", "Consumption.",
@@ -385,7 +386,7 @@ async function main() {
   await grantByPrefix(financeManagerRole.id, [
     "Finance.", "Accounting.", "Procurement.PurchaseInvoice.", "Procurement.VendorPayment.", "Procurement.PurchaseOrder.View",
     "Procurement.VendorDebitNote.View", "Procurement.Vendor.ViewBankDetails", "Inventory.Item.ViewCost", "Inventory.Reports.View",
-    "Sales.Reports.View", "Procurement.Reports.View", "Consumption.Reports.View",
+    "Sales.Reports.View", "Procurement.Reports.View", "Consumption.Reports.View", "Procurement.AdditionalCostType.",
   ]);
 
   // --- Admin user (TenantAdmin bypasses per-permission checks - see
@@ -515,6 +516,22 @@ async function main() {
     update: {},
     create: { tenantId: tenant.id, code: "NET30", name: "Net 30 Days", days: 30 },
   });
+
+  // Landed-cost types (Transportation/Insurance/Handling) so the GRN and
+  // Purchase Invoice's Additional Costs picker isn't empty on first use.
+  // glAccountId is left unset - admins map each to their own chart of
+  // accounts from the Additional Cost Types screen once it's set up.
+  for (const [code, name] of [
+    ["FREIGHT", "Transportation / Freight"],
+    ["INSURANCE", "Insurance"],
+    ["HANDLING", "Handling"],
+  ] as const) {
+    await prisma.additionalCostType.upsert({
+      where: { tenantId_code: { tenantId: tenant.id, code } },
+      update: {},
+      create: { tenantId: tenant.id, code, name },
+    });
+  }
 
   // Item Type master (separate axis from itemType above, which only routes
   // a product to the Raw Material/Menu/Item screen) - Raw Materials Master

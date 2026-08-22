@@ -127,6 +127,9 @@ model Tenant {
   purchaseInvoiceGrns    PurchaseInvoiceGrn[]
   vendorDebitNotes       VendorDebitNote[]
   vendorPayments         VendorPayment[]
+  additionalCostTypes    AdditionalCostType[]
+  grnAdditionalCosts     GrnAdditionalCost[]
+  purchaseInvoiceAdditionalCosts PurchaseInvoiceAdditionalCost[]
   vendorPaymentInvoices  VendorPaymentInvoice[]
 
   // --- Recipe ---
@@ -597,6 +600,7 @@ model User {
   mrApproved        MaterialRequest[] @relation("MrApprovedBy")
   poCreated         PurchaseOrder[] @relation("PoCreatedBy")
   grnCreated        Grn[] @relation("GrnCreatedBy")
+  purchaseInvoicesCreated PurchaseInvoice[] @relation("PurchaseInvoiceCreatedBy")
 
   @@unique([tenantId, email])
   @@index([tenantId])
@@ -1967,6 +1971,7 @@ model Grn {
   createdBy  User?     @relation("GrnCreatedBy", fields: [createdById], references: [id])
 
   lines             GrnLine[]
+  additionalCosts   GrnAdditionalCost[]
   purchaseInvoices  PurchaseInvoiceGrn[]
   goodsReturns      GoodsReturn[]
 
@@ -1997,6 +2002,72 @@ model GrnLine {
 
   @@index([tenantId, grnId])
   @@map("grn_lines")
+}
+
+/// Setup master for landed-cost line types (Transportation, Insurance,
+/// Handling, ...) added on top of a GRN's or Purchase Invoice's goods value.
+/// glAccountId is resolved manually (like Vendor.payableGlId) rather than a
+/// formal Prisma relation, matching this schema's existing convention for
+/// COA foreign keys that aren't the account's own primary owner.
+model AdditionalCostType {
+  id         String  @id @default(uuid())
+  tenantId   String  @map("tenant_id")
+  code       String
+  name       String
+  glAccountId String? @map("gl_account_id")
+  // Standard Active/Inactive convention (see CrudTable's universal
+  // enable/disable toggle), not a plain boolean, so this master gets that
+  // toggle for free via crudFactory's default statusField="status".
+  status     String  @default("Active")
+
+  tenant     Tenant  @relation(fields: [tenantId], references: [id])
+
+  grnCosts      GrnAdditionalCost[]
+  invoiceCosts  PurchaseInvoiceAdditionalCost[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("additional_cost_types")
+}
+
+/// A landed-cost line (freight, insurance, handling, ...) on a specific GRN -
+/// added to that GRN's own total so it factors into the goods' landed cost
+/// and the GRN-vs-invoice amount match, without changing the price stored on
+/// the item's own GrnLine.unitCost.
+model GrnAdditionalCost {
+  id         String  @id @default(uuid())
+  tenantId   String  @map("tenant_id")
+  grnId      String  @map("grn_id")
+  costTypeId String  @map("cost_type_id")
+  amount     Decimal @db.Decimal(18, 3)
+  remark     String?
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id])
+  grn        Grn                @relation(fields: [grnId], references: [id])
+  costType   AdditionalCostType @relation(fields: [costTypeId], references: [id])
+
+  @@index([tenantId, grnId])
+  @@map("grn_additional_costs")
+}
+
+/// A landed-cost line on the Purchase Invoice itself rather than on any one
+/// GRN - e.g. a freight-forwarder's own separate invoice, or a cost that
+/// wasn't known yet when the goods were received. Counted into the invoice's
+/// own three-way-match expected amount alongside its linked GRNs' value.
+model PurchaseInvoiceAdditionalCost {
+  id                String  @id @default(uuid())
+  tenantId          String  @map("tenant_id")
+  purchaseInvoiceId String  @map("purchase_invoice_id")
+  costTypeId        String  @map("cost_type_id")
+  amount            Decimal @db.Decimal(18, 3)
+  remark            String?
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id])
+  purchaseInvoice   PurchaseInvoice    @relation(fields: [purchaseInvoiceId], references: [id])
+  costType          AdditionalCostType @relation(fields: [costTypeId], references: [id])
+
+  @@index([tenantId, purchaseInvoiceId])
+  @@map("purchase_invoice_additional_costs")
 }
 
 /// Goods Return (GRV) - return accepted/rejected goods to a vendor, per
@@ -2082,17 +2153,26 @@ model PurchaseInvoice {
   vendorId      String   @map("vendor_id")
   invoiceNo     String   @map("invoice_no")
   invoiceDate   DateTime @default(now()) @map("invoice_date")
+  // When the invoice document itself was actually received/logged in,
+  // distinct from the vendor's own invoiceDate printed on it.
+  invoiceReceivedDate DateTime? @map("invoice_received_date")
   gross         Decimal  @default(0) @db.Decimal(18, 3)
   tax           Decimal  @default(0) @db.Decimal(18, 3)
   net           Decimal  @default(0) @db.Decimal(18, 3)
   postingStatus String   @default("Draft") @map("posting_status") // Draft|Submitted|Posted|Cancelled
+  // Taken from the authenticated caller at creation time - same convention
+  // as Grn.createdById / PurchaseOrder.createdById. Used by the
+  // approval-authority check (assertCanApprove) on POST /purchase-invoices/:id/post.
+  createdById   String?  @map("created_by_id")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
   tenant        Tenant   @relation(fields: [tenantId], references: [id])
   vendor        Vendor   @relation(fields: [vendorId], references: [id])
+  createdBy     User?    @relation("PurchaseInvoiceCreatedBy", fields: [createdById], references: [id])
 
   grns          PurchaseInvoiceGrn[]
+  additionalCosts PurchaseInvoiceAdditionalCost[]
   payments      VendorPaymentInvoice[]
   debitNotes    VendorDebitNote[]
 

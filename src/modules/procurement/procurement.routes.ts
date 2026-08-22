@@ -57,6 +57,24 @@ router.use(
   })
 );
 
+// --- Additional Cost Types (landed-cost setup master: Transportation,
+// Insurance, Handling, ... added on top of a GRN's or Purchase Invoice's
+// goods value) -------------------------------------------------------------
+router.use(
+  "/additional-cost-types",
+  crudRouter(prisma.additionalCostType, {
+    permissionKey: "Procurement.AdditionalCostType",
+    createSchema: z.object({
+      code: z.string().min(1).max(30),
+      name: z.string().min(1),
+      // Resolved manually (like Vendor.payableGlId) rather than a formal
+      // Prisma relation/include - the frontend maps this id to a label via
+      // its own chart-of-accounts option list.
+      glAccountId: z.string().uuid().optional(),
+    }),
+  })
+);
+
 // --- Material Requests ------------------------------------------------------
 const mrLineSchema = z.object({
   itemId: z.string().uuid(),
@@ -1395,20 +1413,42 @@ const grnLineSchema = z.object({
   unitCost: z.number().nonnegative().optional(),
 });
 
+const additionalCostLineSchema = z.object({
+  costTypeId: z.string().uuid(),
+  amount: z.number().positive(),
+  remark: z.string().optional(),
+});
+
 router.post(
   "/grns",
   requirePermission("Procurement.Grn.Create"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({
-      companyId: z.string().uuid(),
-      poId: z.string().uuid().optional(),
-      vendorId: z.string().uuid(),
-      branchId: z.string().uuid(),
-      warehouseId: z.string().uuid(),
-      lines: z.array(grnLineSchema).min(1),
-    });
-    const payload = schema.parse(req.body);
+    const schema = z
+      .object({
+        companyId: z.string().uuid(),
+        poId: z.string().uuid().optional(),
+        vendorId: z.string().uuid(),
+        branchId: z.string().uuid(),
+        warehouseId: z.string().uuid(),
+        lines: z.array(grnLineSchema).default([]),
+        additionalCosts: z.array(additionalCostLineSchema).default([]),
+      })
+      // A GRN normally exists to receive goods, but a vendor's freight/
+      // insurance/handling invoice sometimes arrives with nothing to
+      // physically receive against it - allow a "cost-only" GRN (no item
+      // lines) as long as it carries at least one additional cost, instead
+      // of forcing every GRN to have goods lines.
+      .refine((v) => v.lines.length > 0 || v.additionalCosts.length > 0, {
+        message: "A GRN needs at least one item line or one additional cost",
+      });
+    // DocumentScreen's line grid always keeps at least one (possibly still
+    // blank) starter row, even for a cost-only GRN where the user never
+    // touches the Item picker - drop any such untouched row before
+    // validating, so a cost-only submission isn't rejected for failing the
+    // "item required" check on a row nobody meant to fill in.
+    const rawLines = Array.isArray(req.body?.lines) ? req.body.lines.filter((l: any) => l && l.itemId) : [];
+    const payload = schema.parse({ ...req.body, lines: rawLines });
 
     for (const l of payload.lines) {
       if (l.acceptedQty + l.rejectedQty > l.receivedQty + 1e-9) {
@@ -1417,7 +1457,7 @@ router.post(
     }
 
     if (payload.poId) {
-      const po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId } });
+      const po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId }, include: { lines: true } });
       if (!po) throw ApiError.badRequest("poId not found");
       const expired = po.validityDate && po.validityDate.getTime() < Date.now();
       // An authorized user (Approve permission) can still push a GRN through
@@ -1427,6 +1467,52 @@ router.post(
         throw ApiError.badRequest(
           `This purchase order's validity date has passed (${po.validityDate!.toISOString().slice(0, 10)}) - ask an authorized user to extend it before receiving against it.`
         );
+      }
+
+      // Multiple GRNs can be raised against one PO over time - make sure
+      // this one doesn't push the PO's cumulative received qty (per line)
+      // or goods value (whole PO) past what was actually ordered. Counts
+      // every existing GRN regardless of status (Draft or Posted), same
+      // no-status-filter convention as the fullyReceived check in
+      // /grns/:id/post and the receivedQty aggregate on GET
+      // /purchase-orders/:id. Additional costs (freight/insurance/handling)
+      // are intentionally excluded from the amount check - they're outside
+      // the PO's own negotiated item pricing.
+      const existingGrnLines = await prisma.grnLine.findMany({
+        where: { grn: { poId: po.id }, poLineId: { not: null } },
+        select: { poLineId: true, acceptedQty: true },
+      });
+      const receivedByLine = new Map<string, number>();
+      for (const gl of existingGrnLines) {
+        receivedByLine.set(gl.poLineId as string, (receivedByLine.get(gl.poLineId as string) ?? 0) + Number(gl.acceptedQty));
+      }
+      let newlyReceivedTotal = 0;
+      for (const l of payload.lines) {
+        if (!l.poLineId) continue;
+        const poLine = po.lines.find((pl) => pl.id === l.poLineId);
+        if (!poLine) throw ApiError.badRequest("A line references a PO line that doesn't belong to this PO", l);
+        const alreadyReceived = receivedByLine.get(l.poLineId) ?? 0;
+        const afterThis = alreadyReceived + l.acceptedQty;
+        if (afterThis > Number(poLine.qty) + 1e-6) {
+          throw ApiError.badRequest(
+            `Receiving ${l.acceptedQty} more of this item would take the total received to ${afterThis} against an ordered qty of ${Number(poLine.qty)} on this PO line.`,
+            { poLineId: l.poLineId, alreadyReceived, thisGrn: l.acceptedQty, orderedQty: Number(poLine.qty) }
+          );
+        }
+        newlyReceivedTotal += l.acceptedQty * (l.unitCost ?? Number(poLine.unitPrice));
+      }
+      if (newlyReceivedTotal > 0) {
+        const existingGrnValue = existingGrnLines.reduce((sum, gl) => {
+          const poLine = po.lines.find((pl) => pl.id === gl.poLineId);
+          return sum + Number(gl.acceptedQty) * (poLine ? Number(poLine.unitPrice) : 0);
+        }, 0);
+        const poGoodsValue = po.lines.reduce((s, pl) => s + Number(pl.qty) * Number(pl.unitPrice), 0);
+        if (existingGrnValue + newlyReceivedTotal > poGoodsValue + 1e-6) {
+          throw ApiError.badRequest(
+            `This GRN would take the total received value on ${po.poNo} to ${(existingGrnValue + newlyReceivedTotal).toFixed(2)}, above its ordered goods value of ${poGoodsValue.toFixed(2)}.`,
+            { existingGrnValue, thisGrn: newlyReceivedTotal, poGoodsValue }
+          );
+        }
       }
     }
 
@@ -1449,8 +1535,9 @@ router.post(
           // convention as MaterialRequest.requesterId / PurchaseOrder.createdById.
           createdById: req.user?.userId,
           lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+          additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
         },
-        include: { lines: true },
+        include: { lines: true, additionalCosts: { include: { costType: true } } },
       });
     });
 
@@ -1470,6 +1557,7 @@ router.get(
       where,
       include: {
         lines: true,
+        additionalCosts: { include: { costType: true } },
         vendor: true,
         branch: true,
         warehouse: true,
@@ -1490,6 +1578,7 @@ router.get(
       where: { id: req.params.id, tenantId },
       include: {
         lines: { include: { item: true, poLine: true } },
+        additionalCosts: { include: { costType: true } },
         vendor: true,
         // Nested company for the print letterhead - same as MR/PO's own GET :id.
         branch: { include: { company: true } },
@@ -1535,6 +1624,10 @@ router.post(
     const linesWithDetail = await prisma.grnLine.findMany({
       where: { grnId: grn.id },
       include: { item: { include: { glMapping: true } }, poLine: true },
+    });
+    const additionalCostsWithDetail = await prisma.grnAdditionalCost.findMany({
+      where: { grnId: grn.id },
+      include: { costType: true },
     });
 
     await prisma.$transaction(async (tx) => {
@@ -1601,6 +1694,57 @@ router.post(
         });
       }
 
+      // Additional costs (freight/insurance/handling) - Dr each cost type's
+      // own mapped account, Cr GRN-CLEARING for the same accrual the goods
+      // value used above (the vendor is owed for the whole GRN, goods and
+      // extra costs alike, until the purchase invoice settles it). Posted
+      // as its own journal, separate from the goods entry above, so a
+      // missing cost-type GL mapping only affects that cost's own line
+      // rather than blocking the goods posting.
+      if (additionalCostsWithDetail.length > 0) {
+        if (!grnClearing) {
+          await recordPostingException(tx, {
+            tenantId,
+            sourceModule: "Procurement",
+            sourceDocId: grn.id,
+            exceptionType: "Missing GL",
+            message: "GRN-CLEARING account not configured for this company - additional costs not posted",
+          });
+        } else {
+          const byAccount = new Map<string, number>();
+          const unmapped: string[] = [];
+          for (const c of additionalCostsWithDetail) {
+            if (!c.costType.glAccountId) {
+              unmapped.push(c.costType.name);
+              continue;
+            }
+            byAccount.set(c.costType.glAccountId, (byAccount.get(c.costType.glAccountId) ?? 0) + Number(c.amount));
+          }
+          if (unmapped.length > 0) {
+            await recordPostingException(tx, {
+              tenantId,
+              sourceModule: "Procurement",
+              sourceDocId: grn.id,
+              exceptionType: "Missing GL",
+              message: `No GL account configured for additional cost type(s): ${unmapped.join(", ")} - set one on the Additional Cost Types screen`,
+            });
+          }
+          const postableTotal = [...byAccount.values()].reduce((s, v) => s + v, 0);
+          if (postableTotal > 0) {
+            await postJournal(tx, {
+              tenantId,
+              companyId,
+              sourceModule: "Procurement",
+              sourceDocId: grn.id,
+              lines: [
+                ...[...byAccount.entries()].map(([accountId, debit]) => ({ accountId, debit })),
+                { accountId: grnClearing.id, credit: postableTotal },
+              ],
+            });
+          }
+        }
+      }
+
       await tx.grn.update({ where: { id: grn.id }, data: { status: "Posted", qcStatus: "Accepted" } });
 
       if (grn.poId) {
@@ -1619,7 +1763,10 @@ router.post(
       }
     });
 
-    const updated = await prisma.grn.findUnique({ where: { id: grn.id }, include: { lines: true } });
+    const updated = await prisma.grn.findUnique({
+      where: { id: grn.id },
+      include: { lines: true, additionalCosts: { include: { costType: true } } },
+    });
     res.json(updated);
   })
 );
@@ -1863,9 +2010,16 @@ router.post(
       vendorId: z.string().uuid(),
       invoiceNo: z.string().min(1),
       invoiceDate: z.coerce.date().optional(),
+      invoiceReceivedDate: z.coerce.date().optional(),
       gross: z.number().nonnegative(),
       tax: z.number().nonnegative().default(0),
-      grnIds: z.array(z.string().uuid()).min(1),
+      // Shaped as DocumentScreen-style "lines" (one row per linked GRN)
+      // rather than a plain grnIds[] array, so the generic transaction
+      // screen component can render/save this the same way as every other
+      // document - each row just needs the grnId, the rest (GRN No.,
+      // value, ...) is display-only, resolved client-side.
+      lines: z.array(z.object({ grnId: z.string().uuid() })).min(1),
+      additionalCosts: z.array(additionalCostLineSchema).default([]),
     });
     const payload = schema.parse(req.body);
     const net = payload.gross + payload.tax;
@@ -1881,12 +2035,20 @@ router.post(
         vendorId: payload.vendorId,
         invoiceNo: payload.invoiceNo,
         invoiceDate: payload.invoiceDate,
+        invoiceReceivedDate: payload.invoiceReceivedDate,
         gross: payload.gross,
         tax: payload.tax,
         net,
-        grns: { create: payload.grnIds.map((grnId) => ({ tenantId, grnId })) },
+        // Taken from the authenticated caller, not the request body - same
+        // convention as Grn.createdById / PurchaseOrder.createdById.
+        createdById: req.user?.userId,
+        grns: { create: payload.lines.map((l) => ({ tenantId, grnId: l.grnId })) },
+        additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
       },
-      include: { grns: { include: { grn: { include: { lines: true } } } } },
+      include: {
+        grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } } } } } },
+        additionalCosts: { include: { costType: true } },
+      },
     });
 
     res.status(201).json(record);
@@ -1900,10 +2062,34 @@ router.get(
     const tenantId = req.tenant!.id;
     const items = await prisma.purchaseInvoice.findMany({
       where: { tenantId },
-      include: { grns: true },
+      include: {
+        vendor: true,
+        grns: { include: { grn: true } },
+        additionalCosts: { include: { costType: true } },
+        createdBy: { select: { id: true, displayName: true, email: true } },
+      },
       orderBy: { createdAt: "desc" },
     });
     res.json({ data: items });
+  })
+);
+
+router.get(
+  "/purchase-invoices/:id",
+  requirePermission("Procurement.PurchaseInvoice.View"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const record = await prisma.purchaseInvoice.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: {
+        vendor: true,
+        grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } }, branch: { include: { company: true } } } } } },
+        additionalCosts: { include: { costType: true } },
+        createdBy: { select: { id: true, displayName: true, email: true } },
+      },
+    });
+    if (!record) throw ApiError.notFound();
+    res.json(record);
   })
 );
 
@@ -1915,29 +2101,62 @@ router.get(
  */
 router.post(
   "/purchase-invoices/:id/post",
-  requirePermission("Procurement.PurchaseInvoice.Post"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({ companyId: z.string().uuid() });
-    const { companyId } = schema.parse(req.body);
 
     const invoice = await prisma.purchaseInvoice.findFirst({
       where: { id: req.params.id, tenantId },
       include: {
         vendor: true,
-        grns: { include: { grn: { include: { lines: { include: { poLine: true } } } } } },
+        grns: {
+          include: {
+            grn: {
+              include: {
+                lines: { include: { poLine: true } },
+                additionalCosts: true,
+                branch: { select: { companyId: true } },
+              },
+            },
+          },
+        },
+        additionalCosts: { include: { costType: true } },
       },
     });
     if (!invoice) throw ApiError.notFound();
     if (invoice.postingStatus === "Posted") throw ApiError.badRequest("Invoice already posted");
+    // Must hold the Post permission AND be the invoice creator (or somewhere
+    // above them in the manager chain) - see assertCanApprove's doc comment.
+    await assertCanApprove(prisma, req, {
+      tenantId,
+      requesterUserId: invoice.createdById,
+      permission: "Procurement.PurchaseInvoice.Post",
+    });
+    // Resolved from the first linked GRN's branch rather than requiring the
+    // client to send it - the generic lifecycle button (DocumentScreen)
+    // posts an empty body, same as every other module's submit/approve
+    // action. Every linked GRN is expected to belong to the same company
+    // (cross-company invoicing isn't a real workflow here).
+    const companyId = invoice.grns[0]?.grn.branch.companyId;
+    if (!companyId) throw ApiError.badRequest("This invoice has no linked GRN to resolve its company from");
 
-    const expectedAmount = invoice.grns.reduce((sum, bridge) => {
+    const grnGoodsValue = invoice.grns.reduce((sum, bridge) => {
       const linesTotal = bridge.grn.lines.reduce((s, l) => {
         const price = l.poLine ? Number(l.poLine.unitPrice) : Number(l.unitCost ?? 0);
         return s + Number(l.acceptedQty) * price;
       }, 0);
       return sum + linesTotal;
     }, 0);
+    // Each linked GRN's own additional costs (freight/insurance/handling
+    // added at receiving time) count toward the expected match too - the
+    // invoice should cover the GRN's full landed cost, not just its goods.
+    const grnAdditionalCostsValue = invoice.grns.reduce(
+      (sum, bridge) => sum + bridge.grn.additionalCosts.reduce((s, c) => s + Number(c.amount), 0),
+      0
+    );
+    // Plus any additional costs entered on the invoice itself (e.g. a
+    // freight-forwarder's own separate bill, never tied to a GRN).
+    const invoiceAdditionalCostsValue = invoice.additionalCosts.reduce((s, c) => s + Number(c.amount), 0);
+    const expectedAmount = grnGoodsValue + grnAdditionalCostsValue + invoiceAdditionalCostsValue;
 
     // Was a hardcoded 2% constant - now reads the company's own tolerance
     // from the Company Policies screen (falls back to the same 2% if the
@@ -1995,13 +2214,45 @@ router.post(
         (await resolveCoaByCode(tx, tenantId, companyId, "AP-CONTROL"));
 
       if (grnClearing && apControl) {
+        // Invoice-level additional costs (freight-forwarder's own bill, or
+        // anything else added straight on the invoice rather than on a
+        // GRN) were never accrued into GRN-CLEARING at receiving time, so
+        // they're debited straight to their own mapped account instead of
+        // GRN-CLEARING - whatever's left of the invoice's net after that
+        // (goods + each GRN's own additional costs + tax) is what actually
+        // clears the GRN-CLEARING accrual. Any cost type missing a GL
+        // mapping falls back into the GRN-CLEARING debit (keeps the entry
+        // balanced to invoice.net) with an exception logged so it's visible
+        // for correction, rather than silently dropping that amount.
+        const costByAccount = new Map<string, number>();
+        const unmapped: string[] = [];
+        for (const c of invoice.additionalCosts) {
+          if (c.costType.glAccountId) {
+            costByAccount.set(c.costType.glAccountId, (costByAccount.get(c.costType.glAccountId) ?? 0) + Number(c.amount));
+          } else {
+            unmapped.push(c.costType.name);
+          }
+        }
+        if (unmapped.length > 0) {
+          await recordPostingException(tx, {
+            tenantId,
+            sourceModule: "Procurement",
+            sourceDocId: invoice.id,
+            exceptionType: "Missing GL",
+            message: `No GL account configured for additional cost type(s): ${unmapped.join(", ")} - posted to GRN-CLEARING instead`,
+          });
+        }
+        const mappedCostsTotal = [...costByAccount.values()].reduce((s, v) => s + v, 0);
+        const grnClearingDebit = Number(invoice.net) - mappedCostsTotal;
+
         await postJournal(tx, {
           tenantId,
           companyId,
           sourceModule: "Procurement",
           sourceDocId: invoice.id,
           lines: [
-            { accountId: grnClearing.id, debit: Number(invoice.net) },
+            { accountId: grnClearing.id, debit: grnClearingDebit },
+            ...[...costByAccount.entries()].map(([accountId, debit]) => ({ accountId, debit })),
             { accountId: apControl.id, credit: Number(invoice.net) },
           ],
         });
