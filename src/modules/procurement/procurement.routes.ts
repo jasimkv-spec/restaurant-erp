@@ -304,6 +304,20 @@ router.get(
       orderBy: { mr: { requestDate: "asc" } },
     });
 
+    // Temporary diagnostics for the "pull from MR pool" empty-result report -
+    // safe to remove once the root cause is confirmed. Shows exactly how
+    // many approved MR lines exist for this tenant/status before exclusion,
+    // and how many got excluded and why, without changing the response.
+    if (lines.length === 0) {
+      const [approvedMrCount, approvedLineCount] = await Promise.all([
+        prisma.materialRequest.count({ where: { tenantId, status } }),
+        prisma.materialRequestLine.count({ where: { tenantId, mr: { status } } }),
+      ]);
+      console.log(
+        `[po-pool diagnostic] tenantId=${tenantId} status=${status} approvedMrCount=${approvedMrCount} approvedLineCountIgnoringValidity=${approvedLineCount} excludeLineIdsCount=${excludeLineIds.length} excludeLineIds=${JSON.stringify(excludeLineIds)}`
+      );
+    }
+
     const data = lines.map((line) => ({
       mrLineId: line.id,
       mrId: line.mrId,

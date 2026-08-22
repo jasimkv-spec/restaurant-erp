@@ -248,6 +248,12 @@ model Company {
   // block below it) - see DocumentScreen.printRecord.
   transactionHeaderText String? @map("transaction_header_text")
   transactionFooterText String? @map("transaction_footer_text")
+  // Standing Terms & Conditions text printed on every Purchase Order for
+  // this company (payment terms, delivery/inspection terms, penalty
+  // clauses, etc.) - configurable per company so each client/tenant can set
+  // their own wording. See DocumentScreen's printTerms prop, wired up in
+  // PurchaseOrders.tsx only (not printed on Material Requests).
+  poTermsConditions String? @map("po_terms_conditions")
   status         String   @default("Active")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")

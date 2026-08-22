@@ -27,6 +27,7 @@ router.use(
       timeFormat: z.enum(["24h", "12h"]).default("24h"),
       transactionHeaderText: z.string().optional(),
       transactionFooterText: z.string().optional(),
+      poTermsConditions: z.string().optional(),
     }),
     include: { baseCurrency: true },
   })
