@@ -1999,32 +1999,56 @@ model GrnLine {
   batchNo      String?   @map("batch_no")
   expiryDate   DateTime? @map("expiry_date")
   unitCost     Decimal   @default(0) @db.Decimal(18, 6) @map("unit_cost")
+  // Negotiated discount given by the vendor at the time of delivery -
+  // independent of (and layered on top of) whatever discount was already
+  // negotiated on the PO itself. Same either-pct-or-amount convention as
+  // PurchaseOrderLine's own discountPct/discountAmount. Nullable so
+  // "no GRN-level discount" is distinguishable from a real 0.
+  discountPct    Decimal?  @db.Decimal(9, 4) @map("discount_pct")
+  discountAmount Decimal?  @db.Decimal(18, 3) @map("discount_amount")
+  // Extra qty of this same item the vendor throws in free alongside the
+  // paid acceptedQty above (e.g. "100 + 5 free") - enters stock at zero
+  // extra cost (see baseQty's doc comment below: converted together with
+  // acceptedQty, so the same total cost spreads over more physical units
+  // and correctly lowers the resulting average cost), never priced into
+  // lineTotal below.
+  focQty         Decimal   @default(0) @db.Decimal(18, 3) @map("foc_qty")
+  // A whole separate line that's entirely free (e.g. a promotional item
+  // bundled in with the order) - when true, unitCost is ignored for both
+  // lineTotal and stock costing (treated as 0) regardless of what's stored
+  // on it. Same convention as PurchaseOrderLine.isFocLine.
+  isFocLine      Boolean   @default(false) @map("is_foc_line")
+  // Computed and stored at save time alongside lineTotal below (see
+  // computeGrnLineAmounts in procurement.routes.ts) - never hand-entered.
+  taxAmount      Decimal   @default(0) @db.Decimal(18, 3) @map("tax_amount")
   // Tax/discount-inclusive monetary value of this line, for display and for
-  // comparing this GRN against its source PO's own amount - NOT what gets
-  // posted to stock/GL (that's still unitCost x acceptedQty, deliberately
-  // pre-tax - see /grns/:id/post). When tied to a PO line, this is that PO
-  // line's own lineTotal (already tax/discount-inclusive, computed by
-  // poCalc.ts) prorated by the fraction of that line's ordered qty this GRN
-  // is receiving - so fully receiving a PO in one GRN makes this total
-  // exactly match the PO's totalAmount, and several partial GRNs against the
-  // same PO sum back up to it. Falls back to acceptedQty x unitCost for a
-  // line with no PO reference (a direct/no-PO GRN, which has no tax/discount
-  // data to prorate from). Computed and stored at save time - never
-  // hand-entered.
+  // the three-way match against the linked Purchase Invoice (see
+  // computeExpectedInvoiceAmount) - NOT what gets posted to stock/GL
+  // (that's still unitCost x acceptedQty, deliberately pre-tax/pre-discount
+  // - see /grns/:id/post). This GRN line's own math: (acceptedQty x
+  // unitCost, 0 when isFocLine) less this line's own discountPct/
+  // discountAmount above, plus tax at the linked PO line's own rate when
+  // there is one. Deliberately NOT prorated from the PO's own lineTotal -
+  // a GRN can carry its own discount the PO never had (e.g. a discount the
+  // supplier offers at delivery time), so this can legitimately differ from
+  // a straight proration of the PO. Computed and stored at save time -
+  // never hand-entered.
   lineTotal    Decimal   @default(0) @db.Decimal(18, 3) @map("line_total")
-  // acceptedQty converted into the item's own base/stock UOM - the actual
-  // physical quantity that should enter the stock ledger. Needed because a
-  // GRN tied to a PO line inherits that PO line's own purchasing UOM (e.g.
-  // a vendor selling in KG while the item is stocked/recipe-costed in GR),
-  // so acceptedQty alone (still "10", meaning 10 KG) isn't safe to post to
-  // stock directly - it would silently record 10 grams instead of 10,000.
-  // Computed at save time via resolveUomQty (same MaterialRequestLine.baseQty
-  // convention) and null when no conversion path is configured, in which
-  // case posting falls back to acceptedQty unchanged (today's behaviour,
-  // not made worse - just not corrected either until someone adds the
-  // missing UOM Conversion record). A line with no PO reference is assumed
-  // already entered in the item's base UOM (no unit picker on a direct GRN
-  // line today), so baseQty there just equals acceptedQty.
+  // acceptedQty + focQty converted into the item's own base/stock UOM - the
+  // actual physical quantity that should enter the stock ledger (both the
+  // paid and the free units physically arrive and sit in the warehouse).
+  // Needed because a GRN tied to a PO line inherits that PO line's own
+  // purchasing UOM (e.g. a vendor selling in KG while the item is
+  // stocked/recipe-costed in GR), so acceptedQty alone (still "10", meaning
+  // 10 KG) isn't safe to post to stock directly - it would silently record
+  // 10 grams instead of 10,000. Computed at save time via resolveUomQty
+  // (same MaterialRequestLine.baseQty convention) and null when no
+  // conversion path is configured, in which case posting falls back to
+  // acceptedQty + focQty unchanged (today's behaviour, not made worse -
+  // just not corrected either until someone adds the missing UOM
+  // Conversion record). A line with no PO reference is assumed already
+  // entered in the item's base UOM (no unit picker on a direct GRN line
+  // today), so baseQty there just equals acceptedQty + focQty.
   baseQty      Decimal?  @db.Decimal(18, 3) @map("base_qty")
 
   tenant       Tenant    @relation(fields: [tenantId], references: [id])

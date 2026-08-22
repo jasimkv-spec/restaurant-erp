@@ -1411,6 +1411,14 @@ const grnLineSchema = z.object({
   batchNo: z.string().optional(),
   expiryDate: z.coerce.date().optional(),
   unitCost: z.number().nonnegative().optional(),
+  // Discount the vendor offered at delivery time - see GrnLine.discountPct's
+  // own doc comment. Independent of any discount already on the PO line.
+  discountPct: z.number().min(0).max(100).optional(),
+  discountAmount: z.number().nonnegative().optional(),
+  // Free units received alongside acceptedQty - never priced, see
+  // GrnLine.focQty.
+  focQty: z.number().nonnegative().default(0),
+  isFocLine: z.preprocess((v) => v === true || v === "true", z.boolean()).default(false),
 });
 
 const additionalCostLineSchema = z.object({
@@ -1464,7 +1472,10 @@ router.post(
     // tax/discount-inclusive lineTotal figures, instead of re-fetching.
     let po: any = null;
     if (payload.poId) {
-      po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId }, include: { lines: true } });
+      po = await prisma.purchaseOrder.findFirst({
+        where: { id: payload.poId, tenantId },
+        include: { lines: { include: { tax: true } } },
+      });
       if (!po) throw ApiError.badRequest("poId not found");
       const expired = po.validityDate && po.validityDate.getTime() < Date.now();
       // An authorized user (Approve permission) can still push a GRN through
@@ -1523,23 +1534,24 @@ router.post(
       }
     }
 
-    // Tax/discount-inclusive line value, for display/PO-comparison only (see
-    // GrnLine.lineTotal's own doc comment in schema.prisma) - never used for
-    // the actual stock/GL posting, which stays unitCost x acceptedQty
-    // (pre-tax) in /grns/:id/post. Tied to a PO line: prorate that PO line's
-    // own already-computed lineTotal (from poCalc.ts) by the fraction of its
-    // ordered qty this GRN is receiving, so a full single-shot receipt lines
-    // up exactly with the PO's totalAmount, and several partial GRNs against
-    // the same PO sum back up to it. No PO line: just acceptedQty x unitCost,
-    // since there's no tax/discount data to prorate from.
-    function computeGrnLineTotal(l: (typeof payload.lines)[number]): number {
-      if (l.poLineId && po) {
-        const poLine = po.lines.find((pl: any) => pl.id === l.poLineId);
-        if (poLine && Number(poLine.qty) > 0) {
-          return (Number(poLine.lineTotal) / Number(poLine.qty)) * l.acceptedQty;
-        }
-      }
-      return l.acceptedQty * (l.unitCost ?? 0);
+    // This GRN line's own tax/discount-inclusive value, for display and for
+    // the three-way match against the Purchase Invoice - see GrnLine.
+    // lineTotal's own doc comment in schema.prisma for why this is computed
+    // from the GRN's own numbers rather than prorated from the PO. Never
+    // used for the actual stock/GL posting, which stays unitCost x
+    // acceptedQty (pre-tax/pre-discount) in /grns/:id/post.
+    function computeGrnLineAmounts(l: (typeof payload.lines)[number]): { taxAmount: number; lineTotal: number } {
+      const poLine = l.poLineId && po ? po.lines.find((pl: any) => pl.id === l.poLineId) : null;
+      const unitCost = l.isFocLine ? 0 : l.unitCost ?? (poLine ? Number(poLine.unitPrice) : 0);
+      const gross = l.isFocLine ? 0 : l.acceptedQty * unitCost;
+      const discount = l.discountAmount ?? (l.discountPct ? (gross * l.discountPct) / 100 : 0);
+      const net = Math.max(0, gross - discount);
+      // GRN has no tax picker of its own - inherits the linked PO line's
+      // tax rate, same as the discount is layered on top of whatever the PO
+      // already negotiated.
+      const rate = poLine?.tax ? Number(poLine.tax.rate) : 0;
+      const taxAmount = (net * rate) / 100;
+      return { taxAmount, lineTotal: net + taxAmount };
     }
 
     // acceptedQty is in whatever unit this line was received in - the
@@ -1560,7 +1572,16 @@ router.post(
         if (!baseUomId) return Promise.resolve(null);
         const fromUomId = l.poLineId && po ? po.lines.find((pl: any) => pl.id === l.poLineId)?.uomId : baseUomId;
         if (!fromUomId) return Promise.resolve(null);
-        return resolveUomQty(prisma, { tenantId, itemId: l.itemId, fromUomId, toUomId: baseUomId, qty: l.acceptedQty });
+        // Convert acceptedQty + focQty together - both the paid and the
+        // free units physically arrive and need to enter stock (see
+        // GrnLine.baseQty's doc comment).
+        return resolveUomQty(prisma, {
+          tenantId,
+          itemId: l.itemId,
+          fromUomId,
+          toUomId: baseUomId,
+          qty: l.acceptedQty + (l.focQty ?? 0),
+        });
       })
     );
 
@@ -1584,12 +1605,16 @@ router.post(
           // convention as MaterialRequest.requesterId / PurchaseOrder.createdById.
           createdById: req.user?.userId,
           lines: {
-            create: payload.lines.map((l, i) => ({
-              ...l,
-              tenantId,
-              lineTotal: computeGrnLineTotal(l),
-              baseQty: lineBaseQtys[i],
-            })),
+            create: payload.lines.map((l, i) => {
+              const { taxAmount, lineTotal } = computeGrnLineAmounts(l);
+              return {
+                ...l,
+                tenantId,
+                taxAmount,
+                lineTotal,
+                baseQty: lineBaseQtys[i],
+              };
+            }),
           },
           additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
         },
@@ -1781,7 +1806,12 @@ router.post(
 
       for (const line of linesWithDetail) {
         if (Number(line.acceptedQty) <= 0) continue;
-        const unitCost = line.unitCost && Number(line.unitCost) > 0
+        // A whole-line FOC line is entirely free - zero cost basis for
+        // stock costing too, regardless of whatever's stored in unitCost
+        // (mirrors PurchaseOrderLine.isFocLine's own treatment).
+        const unitCost = line.isFocLine
+          ? 0
+          : line.unitCost && Number(line.unitCost) > 0
           ? Number(line.unitCost)
           : line.poLine
           ? Number(line.poLine.unitPrice)
@@ -1794,10 +1824,15 @@ router.post(
         // in schema.prisma). Convert qty and per-unit cost together so the
         // total value posted to stock stays exactly acceptedQty x unitCost
         // either way - only the qty/rate split changes, not the total.
-        // Falls back to acceptedQty unchanged (factor 1) when no baseQty
-        // was resolved at save time (e.g. no UOM Conversion configured).
+        // baseQty already includes focQty (converted at save time), so the
+        // free units ride along at no extra cost, correctly diluting the
+        // resulting average unit cost. Falls back to acceptedQty + focQty
+        // unchanged (factor 1) when no baseQty was resolved at save time
+        // (e.g. no UOM Conversion configured).
         const qtyForStock =
-          line.baseQty != null && Number(line.baseQty) > 0 ? Number(line.baseQty) : Number(line.acceptedQty);
+          line.baseQty != null && Number(line.baseQty) > 0
+            ? Number(line.baseQty)
+            : Number(line.acceptedQty) + Number(line.focQty ?? 0);
         const unitCostForStock = qtyForStock > 0 ? (Number(line.acceptedQty) * unitCost) / qtyForStock : unitCost;
 
         await postStockMovement(tx, {
@@ -2158,14 +2193,20 @@ router.get(
 
 /**
  * Expected AP amount for a set of GRNs, per BRD 5.4's three-way match: each
- * GRN's own goods value (PO price x accepted qty, or unitCost when there's
- * no PO line) plus that GRN's own additional costs (freight/insurance/
- * handling accrued at receiving time), summed across every GRN, plus any
- * additional costs entered on the invoice itself (e.g. a freight-
- * forwarder's own separate bill never tied to a GRN). Shared by the create
- * route (blocks saving a mismatched invoice in the first place) and the
- * post route (re-checks at posting time in case a GRN's value changed
- * since this invoice was drafted) so the two can't drift apart.
+ * GRN's own goods value (the GRN line's own recorded lineTotal - accepted
+ * qty x the unit cost actually entered on that GRN, tax/discount-inclusive -
+ * NOT the PO's ordered qty x PO unit price) plus that GRN's own additional
+ * costs (freight/insurance/handling accrued at receiving time), summed
+ * across every GRN, plus any additional costs entered on the invoice itself
+ * (e.g. a freight-forwarder's own separate bill never tied to a GRN).
+ * Deliberately matches against the GRN, not the PO: the GRN is what was
+ * actually received and costed (a price variance approved at receiving, a
+ * partial receipt, etc. all show up on the GRN and may differ from the PO),
+ * so that's the correct source of truth for what the vendor's invoice
+ * should reconcile against. Shared by the create route (blocks saving a
+ * mismatched invoice in the first place) and the post route (re-checks at
+ * posting time in case a GRN's value changed since this invoice was
+ * drafted) so the two can't drift apart.
  */
 function computeExpectedInvoiceAmount(
   // Amount/qty/price fields are Prisma Decimal at runtime (or a plain
@@ -2174,15 +2215,12 @@ function computeExpectedInvoiceAmount(
   // every field is immediately run through Number() below regardless.
   grns: {
     additionalCosts: { amount: any }[];
-    lines: { acceptedQty: any; unitCost: any; poLine: { unitPrice: any } | null }[];
+    lines: { lineTotal: any }[];
   }[],
   invoiceAdditionalCosts: { amount: any }[]
 ) {
   const grnGoodsValue = grns.reduce((sum, grn) => {
-    const linesTotal = grn.lines.reduce((s, l) => {
-      const price = l.poLine ? Number(l.poLine.unitPrice) : Number(l.unitCost ?? 0);
-      return s + Number(l.acceptedQty) * price;
-    }, 0);
+    const linesTotal = grn.lines.reduce((s, l) => s + Number(l.lineTotal ?? 0), 0);
     return sum + linesTotal;
   }, 0);
   const grnAdditionalCostsValue = grns.reduce(
