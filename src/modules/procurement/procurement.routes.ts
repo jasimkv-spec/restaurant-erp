@@ -1496,7 +1496,7 @@ router.post(
       let newlyReceivedTotal = 0;
       for (const l of payload.lines) {
         if (!l.poLineId) continue;
-        const poLine = po.lines.find((pl) => pl.id === l.poLineId);
+        const poLine = po.lines.find((pl: any) => pl.id === l.poLineId);
         if (!poLine) throw ApiError.badRequest("A line references a PO line that doesn't belong to this PO", l);
         const alreadyReceived = receivedByLine.get(l.poLineId) ?? 0;
         const afterThis = alreadyReceived + l.acceptedQty;
@@ -1510,10 +1510,10 @@ router.post(
       }
       if (newlyReceivedTotal > 0) {
         const existingGrnValue = existingGrnLines.reduce((sum, gl) => {
-          const poLine = po.lines.find((pl) => pl.id === gl.poLineId);
+          const poLine = po.lines.find((pl: any) => pl.id === gl.poLineId);
           return sum + Number(gl.acceptedQty) * (poLine ? Number(poLine.unitPrice) : 0);
         }, 0);
-        const poGoodsValue = po.lines.reduce((s, pl) => s + Number(pl.qty) * Number(pl.unitPrice), 0);
+        const poGoodsValue = po.lines.reduce((s: number, pl: any) => s + Number(pl.qty) * Number(pl.unitPrice), 0);
         if (existingGrnValue + newlyReceivedTotal > poGoodsValue + 1e-6) {
           throw ApiError.badRequest(
             `This GRN would take the total received value on ${po.poNo} to ${(existingGrnValue + newlyReceivedTotal).toFixed(2)}, above its ordered goods value of ${poGoodsValue.toFixed(2)}.`,
@@ -1534,7 +1534,7 @@ router.post(
     // since there's no tax/discount data to prorate from.
     function computeGrnLineTotal(l: (typeof payload.lines)[number]): number {
       if (l.poLineId && po) {
-        const poLine = po.lines.find((pl) => pl.id === l.poLineId);
+        const poLine = po.lines.find((pl: any) => pl.id === l.poLineId);
         if (poLine && Number(poLine.qty) > 0) {
           return (Number(poLine.lineTotal) / Number(poLine.qty)) * l.acceptedQty;
         }
