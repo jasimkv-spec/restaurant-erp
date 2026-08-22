@@ -1621,6 +1621,48 @@ router.get(
   })
 );
 
+router.delete(
+  "/grns/:id",
+  // GRN has no dedicated .Edit permission seeded yet (only .Create/.View/.Post
+  // exist - see prisma/seed.ts), and adding a new permission string requires a
+  // manual reseed the user can't run themselves. Reusing .Create here since
+  // it's already granted to every role that can make a GRN in the first place.
+  requirePermission("Procurement.Grn.Create"),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.tenant!.id;
+    const existing = await prisma.grn.findFirst({ where: { id: req.params.id, tenantId } });
+    if (!existing) throw ApiError.notFound();
+    if (existing.status !== "Draft") {
+      throw ApiError.badRequest(`Cannot delete a GRN in status ${existing.status} - only Draft GRNs can be deleted`);
+    }
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.grnLine.deleteMany({ where: { grnId: existing.id } });
+        await tx.grnAdditionalCost.deleteMany({ where: { grnId: existing.id } });
+        await tx.grn.delete({ where: { id: existing.id } });
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && (err.code === "P2003" || err.code === "P2014")) {
+        throw ApiError.badRequest("This GRN is referenced elsewhere and can't be deleted.");
+      }
+      throw err;
+    }
+
+    await writeAuditLog(prisma, {
+      tenantId,
+      userId: req.user?.userId,
+      moduleCode: "Procurement.Grn",
+      recordTable: "grns",
+      recordId: req.params.id,
+      action: "Deleted",
+      oldValue: existing,
+    });
+
+    res.status(204).send();
+  })
+);
+
 /**
  * Posts the GRN: appends stock_ledger rows for each accepted line (weighted
  * average costing), and books a provisional GL entry Dr Inventory Asset /
