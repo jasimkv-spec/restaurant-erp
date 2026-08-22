@@ -369,7 +369,19 @@ router.get(
       },
     });
     if (!record) throw ApiError.notFound();
-    res.json(record);
+
+    // Purchase Orders raised from this MR (see PurchaseOrderLine.sourceMrId) -
+    // for the detail view's "Related Documents" panel (DocumentScreen's
+    // relatedDocuments prop). One MR can feed several POs (e.g. lines split
+    // across vendors), and `distinct` collapses several lines from the same
+    // PO down to one entry.
+    const poLines = await prisma.purchaseOrderLine.findMany({
+      where: { tenantId, sourceMrId: record.id },
+      distinct: ["poId"],
+      select: { po: { select: { id: true, poNo: true, status: true } } },
+    });
+
+    res.json({ ...record, relatedPurchaseOrders: poLines.map((l) => l.po) });
   })
 );
 
@@ -1171,12 +1183,18 @@ router.get(
     const record = await prisma.purchaseOrder.findFirst({
       where: { id: req.params.id, tenantId },
       include: {
-        lines: { include: { item: true, uom: true, tax: true } },
+        // sourceMr - which MR (if any) this line was pulled in from, for
+        // the detail view's "Related Documents" panel. See
+        // PurchaseOrderLine.sourceMrId's own relation.
+        lines: { include: { item: true, uom: true, tax: true, sourceMr: { select: { id: true, mrNo: true } } } },
         vendor: true,
         // Nested company for the print letterhead - see the same comment on
         // GET /material-requests/:id above.
         branch: { include: { company: true } },
-        grns: true,
+        // purchaseInvoices nested under each GRN - lets the detail view
+        // also show which Purchase Invoice(s) settled this PO's GRNs,
+        // without a second round trip through the GRN screen.
+        grns: { include: { purchaseInvoices: { include: { purchaseInvoice: { select: { id: true, piNo: true, invoiceNo: true, postingStatus: true } } } } } },
         currency: true,
         paymentTerms: true,
         shipmentType: true,
@@ -1665,6 +1683,9 @@ router.get(
         branch: { include: { company: true } },
         warehouse: true,
         po: true,
+        // Which Purchase Invoice(s) this GRN has been linked to, for the
+        // detail view's "Related Documents" panel.
+        purchaseInvoices: { include: { purchaseInvoice: { select: { id: true, piNo: true, invoiceNo: true, postingStatus: true } } } },
         createdBy: { select: { id: true, displayName: true, email: true } },
       },
     });
@@ -2360,7 +2381,10 @@ router.get(
       where: { id: req.params.id, tenantId },
       include: {
         vendor: true,
-        grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } }, branch: { include: { company: true } } } } } },
+        // po nested on each linked GRN - lets the detail view's "Related
+        // Documents" panel link straight through to the source PO without
+        // a second round trip.
+        grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } }, branch: { include: { company: true } }, po: { select: { id: true, poNo: true } } } } } },
         additionalCosts: { include: { costType: true } },
         createdBy: { select: { id: true, displayName: true, email: true } },
       },
