@@ -2191,7 +2191,7 @@ model PurchaseInvoice {
   // configurable from Setup > Document Series like the rest. Distinct from
   // invoiceNo below, which is the vendor's own supplier invoice number
   // printed on their paperwork - not something this system numbers at all.
-  piNo          String   @map("pi_no")
+  piNo          String?  @map("pi_no")
   invoiceNo     String   @map("invoice_no")
   invoiceDate   DateTime @default(now()) @map("invoice_date")
   // When the invoice document itself was actually received/logged in,
