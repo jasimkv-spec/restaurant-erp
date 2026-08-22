@@ -1431,6 +1431,9 @@ router.post(
         vendorId: z.string().uuid(),
         branchId: z.string().uuid(),
         warehouseId: z.string().uuid(),
+        // The vendor's own DO/invoice number for this specific delivery
+        // batch - see Grn.vendorRefNo's own doc comment in schema.prisma.
+        vendorRefNo: z.string().optional(),
         lines: z.array(grnLineSchema).default([]),
         additionalCosts: z.array(additionalCostLineSchema).default([]),
       })
@@ -1456,8 +1459,12 @@ router.post(
       }
     }
 
+    // Hoisted so the line-total computation below (after this whole
+    // validation block) can reuse the same PO + its lines' own already
+    // tax/discount-inclusive lineTotal figures, instead of re-fetching.
+    let po: any = null;
     if (payload.poId) {
-      const po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId }, include: { lines: true } });
+      po = await prisma.purchaseOrder.findFirst({ where: { id: payload.poId, tenantId }, include: { lines: true } });
       if (!po) throw ApiError.badRequest("poId not found");
       const expired = po.validityDate && po.validityDate.getTime() < Date.now();
       // An authorized user (Approve permission) can still push a GRN through
@@ -1516,6 +1523,25 @@ router.post(
       }
     }
 
+    // Tax/discount-inclusive line value, for display/PO-comparison only (see
+    // GrnLine.lineTotal's own doc comment in schema.prisma) - never used for
+    // the actual stock/GL posting, which stays unitCost x acceptedQty
+    // (pre-tax) in /grns/:id/post. Tied to a PO line: prorate that PO line's
+    // own already-computed lineTotal (from poCalc.ts) by the fraction of its
+    // ordered qty this GRN is receiving, so a full single-shot receipt lines
+    // up exactly with the PO's totalAmount, and several partial GRNs against
+    // the same PO sum back up to it. No PO line: just acceptedQty x unitCost,
+    // since there's no tax/discount data to prorate from.
+    function computeGrnLineTotal(l: (typeof payload.lines)[number]): number {
+      if (l.poLineId && po) {
+        const poLine = po.lines.find((pl) => pl.id === l.poLineId);
+        if (poLine && Number(poLine.qty) > 0) {
+          return (Number(poLine.lineTotal) / Number(poLine.qty)) * l.acceptedQty;
+        }
+      }
+      return l.acceptedQty * (l.unitCost ?? 0);
+    }
+
     const record = await prisma.$transaction(async (tx) => {
       const grnNo = await nextDocumentNumber(tx, {
         tenantId,
@@ -1531,10 +1557,13 @@ router.post(
           vendorId: payload.vendorId,
           branchId: payload.branchId,
           warehouseId: payload.warehouseId,
+          vendorRefNo: payload.vendorRefNo,
           // Taken from the authenticated caller, not the request body - same
           // convention as MaterialRequest.requesterId / PurchaseOrder.createdById.
           createdById: req.user?.userId,
-          lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
+          lines: {
+            create: payload.lines.map((l) => ({ ...l, tenantId, lineTotal: computeGrnLineTotal(l) })),
+          },
           additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
         },
         include: { lines: true, additionalCosts: { include: { costType: true } } },

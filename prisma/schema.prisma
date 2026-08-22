@@ -1960,6 +1960,13 @@ model Grn {
   // as MaterialRequest.requesterId / PurchaseOrder.createdById. Used by the
   // approval-authority check (assertCanApprove) on POST /grns/:id/post.
   createdById String? @map("created_by_id")
+  // The vendor's own Delivery Order / packing-slip / invoice number for this
+  // specific delivery batch - distinct from the formal Purchase Invoice
+  // module (which does the real 3-way match + AP posting). Just a
+  // receiving-time reference so warehouse staff can trace which paperwork a
+  // given GRN corresponds to when a vendor splits delivery of one PO across
+  // several trips (each with its own DO/invoice number).
+  vendorRefNo String? @map("vendor_ref_no")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
 
@@ -1992,6 +1999,19 @@ model GrnLine {
   batchNo      String?   @map("batch_no")
   expiryDate   DateTime? @map("expiry_date")
   unitCost     Decimal   @default(0) @db.Decimal(18, 6) @map("unit_cost")
+  // Tax/discount-inclusive monetary value of this line, for display and for
+  // comparing this GRN against its source PO's own amount - NOT what gets
+  // posted to stock/GL (that's still unitCost x acceptedQty, deliberately
+  // pre-tax - see /grns/:id/post). When tied to a PO line, this is that PO
+  // line's own lineTotal (already tax/discount-inclusive, computed by
+  // poCalc.ts) prorated by the fraction of that line's ordered qty this GRN
+  // is receiving - so fully receiving a PO in one GRN makes this total
+  // exactly match the PO's totalAmount, and several partial GRNs against the
+  // same PO sum back up to it. Falls back to acceptedQty x unitCost for a
+  // line with no PO reference (a direct/no-PO GRN, which has no tax/discount
+  // data to prorate from). Computed and stored at save time - never
+  // hand-entered.
+  lineTotal    Decimal   @default(0) @db.Decimal(18, 3) @map("line_total")
 
   tenant       Tenant    @relation(fields: [tenantId], references: [id])
   grn          Grn       @relation(fields: [grnId], references: [id])
