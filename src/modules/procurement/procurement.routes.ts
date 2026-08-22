@@ -2238,49 +2238,56 @@ router.post(
       throw ApiError.badRequest("One or more selected GRNs could not be found");
     }
     const expectedAmount = computeExpectedInvoiceAmount(linkedGrns, payload.additionalCosts);
+    // Guaranteed by the lines.min(1) + length-match check above (every
+    // grnId resolved to a real GRN, which always has a branch/company) -
+    // guarded explicitly anyway since nextDocumentNumber below needs a
+    // definite string, not "possibly undefined".
     const companyId = linkedGrns[0]?.branch.companyId;
-    if (companyId) {
-      const tolerancePolicy = await resolvePolicy(prisma, {
-        tenantId,
-        companyId,
-        policyType: "PoGrnInvoiceTolerancePct",
-        defaultAllow: true,
-        defaultValue: 2,
-      });
-      const tolerancePct = (tolerancePolicy.value ?? 2) / 100;
-      const variance = expectedAmount === 0 ? 0 : Math.abs(payload.gross - expectedAmount) / expectedAmount;
-      if (variance > tolerancePct) {
-        throw ApiError.badRequest(
-          `Invoice amount ${payload.gross} doesn't match the linked GRN(s) value of ${expectedAmount.toFixed(2)} within the allowed tolerance (variance ${(variance * 100).toFixed(1)}%, allowed ${(tolerancePct * 100).toFixed(1)}%). Check the Supplier Invoice Amount or the additional costs before saving.`,
-          { expectedAmount, invoiceGross: payload.gross, tolerancePct }
-        );
-      }
+    if (!companyId) throw ApiError.badRequest("Could not resolve a company from the selected GRN(s)");
+    const tolerancePolicy = await resolvePolicy(prisma, {
+      tenantId,
+      companyId,
+      policyType: "PoGrnInvoiceTolerancePct",
+      defaultAllow: true,
+      defaultValue: 2,
+    });
+    const tolerancePct = (tolerancePolicy.value ?? 2) / 100;
+    const variance = expectedAmount === 0 ? 0 : Math.abs(payload.gross - expectedAmount) / expectedAmount;
+    if (variance > tolerancePct) {
+      throw ApiError.badRequest(
+        `Invoice amount ${payload.gross} doesn't match the linked GRN(s) value of ${expectedAmount.toFixed(2)} within the allowed tolerance (variance ${(variance * 100).toFixed(1)}%, allowed ${(tolerancePct * 100).toFixed(1)}%). Check the Supplier Invoice Amount or the additional costs before saving.`,
+        { expectedAmount, invoiceGross: payload.gross, tolerancePct }
+      );
     }
 
-    const record = await prisma.purchaseInvoice.create({
-      data: {
-        tenantId,
-        vendorId: payload.vendorId,
-        invoiceNo: payload.invoiceNo,
-        invoiceDate: payload.invoiceDate,
-        invoiceReceivedDate: payload.invoiceReceivedDate,
-        gross: payload.gross,
-        tax: payload.tax,
-        net,
-        // Taken from the authenticated caller, not the request body - same
-        // convention as Grn.createdById / PurchaseOrder.createdById.
-        createdById: req.user?.userId,
-        // The frontend sends one "line" per underlying GRN line (for
-        // item/qty/price/tax detail parity with a PO), so several rows can
-        // share the same grnId - dedupe before creating the bridge, since
-        // the invoice-to-GRN link itself is per-GRN, not per-line.
-        grns: { create: Array.from(new Set(payload.lines.map((l) => l.grnId))).map((grnId) => ({ tenantId, grnId })) },
-        additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
-      },
-      include: {
-        grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } } } } } },
-        additionalCosts: { include: { costType: true } },
-      },
+    const record = await prisma.$transaction(async (tx) => {
+      const piNo = await nextDocumentNumber(tx, { tenantId, companyId, moduleCode: "PurchaseInvoice", defaultPrefix: "PI" });
+      return tx.purchaseInvoice.create({
+        data: {
+          tenantId,
+          vendorId: payload.vendorId,
+          piNo,
+          invoiceNo: payload.invoiceNo,
+          invoiceDate: payload.invoiceDate,
+          invoiceReceivedDate: payload.invoiceReceivedDate,
+          gross: payload.gross,
+          tax: payload.tax,
+          net,
+          // Taken from the authenticated caller, not the request body - same
+          // convention as Grn.createdById / PurchaseOrder.createdById.
+          createdById: req.user?.userId,
+          // The frontend sends one "line" per underlying GRN line (for
+          // item/qty/price/tax detail parity with a PO), so several rows can
+          // share the same grnId - dedupe before creating the bridge, since
+          // the invoice-to-GRN link itself is per-GRN, not per-line.
+          grns: { create: Array.from(new Set(payload.lines.map((l) => l.grnId))).map((grnId) => ({ tenantId, grnId })) },
+          additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
+        },
+        include: {
+          grns: { include: { grn: { include: { lines: true, additionalCosts: { include: { costType: true } } } } } },
+          additionalCosts: { include: { costType: true } },
+        },
+      });
     });
 
     res.status(201).json(record);

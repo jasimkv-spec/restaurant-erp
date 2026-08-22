@@ -2185,6 +2185,13 @@ model PurchaseInvoice {
   id            String   @id @default(uuid())
   tenantId      String   @map("tenant_id")
   vendorId      String   @map("vendor_id")
+  // This tenant's own internal document number (e.g. "PI-000001"), allocated
+  // via nextDocumentNumber/moduleCode "PurchaseInvoice" - same convention as
+  // every other document type (Grn.grnNo, PurchaseOrder.poNo, etc.), and
+  // configurable from Setup > Document Series like the rest. Distinct from
+  // invoiceNo below, which is the vendor's own supplier invoice number
+  // printed on their paperwork - not something this system numbers at all.
+  piNo          String   @map("pi_no")
   invoiceNo     String   @map("invoice_no")
   invoiceDate   DateTime @default(now()) @map("invoice_date")
   // When the invoice document itself was actually received/logged in,
@@ -2211,6 +2218,7 @@ model PurchaseInvoice {
   debitNotes    VendorDebitNote[]
 
   @@unique([tenantId, vendorId, invoiceNo])
+  @@unique([tenantId, piNo])
   @@index([tenantId])
   @@map("purchase_invoices")
 }
