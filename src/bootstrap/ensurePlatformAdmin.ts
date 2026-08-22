@@ -56,18 +56,18 @@ export async function ensurePlatformAdmin() {
     },
   });
 
-  await prisma.userRole.upsert({
-    where: {
-      tenantId_userId_roleId_companyId: {
-        tenantId: tenant.id,
-        userId: user.id,
-        roleId: role.id,
-        companyId: null,
-      },
-    },
-    update: {},
-    create: { tenantId: tenant.id, userId: user.id, roleId: role.id, companyId: null },
+  // Not a prisma upsert here: the tenantId_userId_roleId_companyId compound
+  // unique can't be targeted by Prisma's generated `where` type when
+  // companyId is null (nullable columns are excluded from compound-unique
+  // lookups), so this does the same "create if missing" idempotently by hand.
+  const existingUserRole = await prisma.userRole.findFirst({
+    where: { tenantId: tenant.id, userId: user.id, roleId: role.id, companyId: null },
   });
+  if (!existingUserRole) {
+    await prisma.userRole.create({
+      data: { tenantId: tenant.id, userId: user.id, roleId: role.id, companyId: null },
+    });
+  }
 
   console.log(`[platform-admin] Ready - log in with tenant code "platform", email ${email}.`);
 }
