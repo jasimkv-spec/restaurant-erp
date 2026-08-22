@@ -256,18 +256,21 @@ router.get(
 );
 
 /**
- * Pool of Approved MR lines available for direct pull into a new Purchase
- * Order (task: "Option to retrieve MR from approved MR list for direct PO
- * creation"). Deliberately a separate, flatter shape than
- * consolidation-pool above (one row per MR line, not grouped by item)
- * since a PO-creation picker wants to show "which MR/branch is this qty
- * from" per row, not an aggregated total.
+ * Approved MRs available to recall whole into a new Purchase Order (task:
+ * "Recall from MR" - search/browse one MR, pull in every line on it, then
+ * add/remove lines on the PO as needed). Whole-document rather than
+ * line-level: once any line on an MR has been pulled into a PO, the entire
+ * MR drops off this list for good, even if the PO editor later removes some
+ * of those lines - an MR that's been raised against is considered spoken
+ * for as a document, not a per-line pool of demand.
  *
- * Excludes a line if it's already sitting in a live (non-Cancelled) MR
- * Consolidation (same exclusion consolidation-pool uses - once a line is
- * pooled for RFQ sourcing it shouldn't also be picked straight into a PO)
- * or if it's already been pulled into any Purchase Order line via
- * sourceMrLineId, so the same demand can't be double-ordered.
+ * Excludes an MR if any of its lines are sitting in a live (non-Cancelled)
+ * MR Consolidation (same exclusion consolidation-pool uses) or if any of
+ * its lines have already been pulled into any Purchase Order line via
+ * sourceMrId, so the same demand can't be double-ordered.
+ *
+ * ?search= filters by MR number (case-insensitive contains) for the
+ * type-to-search picker; omit to browse the full list.
  *
  * Registered ahead of GET /material-requests/:id for the same route-
  * ordering reason as check-duplicate/consolidation-pool above.
@@ -277,7 +280,7 @@ router.get(
   requirePermission("Procurement.PurchaseOrder.Create"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const status = typeof req.query.status === "string" ? req.query.status : "Approved";
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
 
     const [consolidated, alreadyOnPo] = await Promise.all([
       prisma.mrConsolidationLine.findMany({
@@ -285,54 +288,44 @@ router.get(
         select: { mrLineId: true },
       }),
       prisma.purchaseOrderLine.findMany({
-        where: { tenantId, sourceMrLineId: { not: null } },
-        select: { sourceMrLineId: true },
+        where: { tenantId, sourceMrId: { not: null } },
+        select: { sourceMrId: true },
       }),
     ]);
-    const excludeLineIds = [
-      ...consolidated.map((l) => l.mrLineId),
-      ...alreadyOnPo.map((l) => l.sourceMrLineId as string),
-    ];
 
-    const lines = await prisma.materialRequestLine.findMany({
-      where: {
-        tenantId,
-        id: { notIn: excludeLineIds },
-        mr: { status, OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }] },
-      },
-      include: { item: true, uom: true, mr: { include: { branch: true } } },
-      orderBy: { mr: { requestDate: "asc" } },
-    });
-
-    // Temporary diagnostics for the "pull from MR pool" empty-result report -
-    // safe to remove once the root cause is confirmed. Shows exactly how
-    // many approved MR lines exist for this tenant/status before exclusion,
-    // and how many got excluded and why, without changing the response.
-    if (lines.length === 0) {
-      const [approvedMrCount, approvedLineCount] = await Promise.all([
-        prisma.materialRequest.count({ where: { tenantId, status } }),
-        prisma.materialRequestLine.count({ where: { tenantId, mr: { status } } }),
-      ]);
-      console.log(
-        `[po-pool diagnostic] tenantId=${tenantId} status=${status} approvedMrCount=${approvedMrCount} approvedLineCountIgnoringValidity=${approvedLineCount} excludeLineIdsCount=${excludeLineIds.length} excludeLineIds=${JSON.stringify(excludeLineIds)}`
-      );
+    const excludeMrIds = new Set<string>();
+    alreadyOnPo.forEach((l) => l.sourceMrId && excludeMrIds.add(l.sourceMrId));
+    if (consolidated.length) {
+      const consolidatedLines = await prisma.materialRequestLine.findMany({
+        where: { id: { in: consolidated.map((l) => l.mrLineId) } },
+        select: { mrId: true },
+      });
+      consolidatedLines.forEach((l) => excludeMrIds.add(l.mrId));
     }
 
-    const data = lines.map((line) => ({
-      mrLineId: line.id,
-      mrId: line.mrId,
-      mrNo: line.mr.mrNo,
-      branchId: line.mr.branchId,
-      branchName: line.mr.branch.name,
-      itemId: line.itemId,
-      itemCode: line.item.code,
-      itemName: line.item.name,
-      uomId: line.uomId,
-      uomCode: line.uom.code,
-      qty: Number(line.approvedQty ?? line.requestedQty),
-    }));
+    const mrs = await prisma.materialRequest.findMany({
+      where: {
+        tenantId,
+        status: "Approved",
+        OR: [{ validityDate: null }, { validityDate: { gte: new Date() } }],
+        id: { notIn: Array.from(excludeMrIds) },
+        ...(search ? { mrNo: { contains: search, mode: "insensitive" as const } } : {}),
+      },
+      include: { branch: true, _count: { select: { lines: true } } },
+      orderBy: { requestDate: "asc" },
+      take: 50,
+    });
 
-    res.json({ data });
+    res.json({
+      data: mrs.map((mr) => ({
+        mrId: mr.id,
+        mrNo: mr.mrNo,
+        branchId: mr.branchId,
+        branchName: mr.branch.name,
+        requestDate: mr.requestDate,
+        lineCount: mr._count.lines,
+      })),
+    });
   })
 );
 
