@@ -189,7 +189,7 @@ export async function assertCanApprove(
   // a stray circular manager assignment can't loop forever.
   let currentId: string | null = params.requesterUserId;
   for (let i = 0; i < 25 && currentId; i++) {
-    const current = await tx.user.findFirst({
+    const current: { managerId: string | null } | null = await tx.user.findFirst({
       where: { id: currentId, tenantId: params.tenantId },
       select: { managerId: true },
     });
