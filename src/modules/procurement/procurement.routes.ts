@@ -1542,6 +1542,28 @@ router.post(
       return l.acceptedQty * (l.unitCost ?? 0);
     }
 
+    // acceptedQty is in whatever unit this line was received in - the
+    // linked PO line's own uomId when there is one (a vendor selling in KG
+    // while the item's stocked in GR is the whole point of this fix - see
+    // GrnLine.baseQty's doc comment), or already the item's base UOM for a
+    // direct/no-PO line (no unit picker on those today). Resolved once per
+    // line, outside the transaction below, since it's a pure read (item
+    // master + UOM Conversion master) with nothing to roll back.
+    const itemIds = Array.from(new Set(payload.lines.map((l) => l.itemId)));
+    const itemsForBaseQty = itemIds.length
+      ? await prisma.item.findMany({ where: { tenantId, id: { in: itemIds } }, select: { id: true, baseUomId: true } })
+      : [];
+    const baseUomByItemId = new Map(itemsForBaseQty.map((i) => [i.id, i.baseUomId]));
+    const lineBaseQtys = await Promise.all(
+      payload.lines.map((l) => {
+        const baseUomId = baseUomByItemId.get(l.itemId);
+        if (!baseUomId) return Promise.resolve(null);
+        const fromUomId = l.poLineId && po ? po.lines.find((pl: any) => pl.id === l.poLineId)?.uomId : baseUomId;
+        if (!fromUomId) return Promise.resolve(null);
+        return resolveUomQty(prisma, { tenantId, itemId: l.itemId, fromUomId, toUomId: baseUomId, qty: l.acceptedQty });
+      })
+    );
+
     const record = await prisma.$transaction(async (tx) => {
       const grnNo = await nextDocumentNumber(tx, {
         tenantId,
@@ -1562,7 +1584,12 @@ router.post(
           // convention as MaterialRequest.requesterId / PurchaseOrder.createdById.
           createdById: req.user?.userId,
           lines: {
-            create: payload.lines.map((l) => ({ ...l, tenantId, lineTotal: computeGrnLineTotal(l) })),
+            create: payload.lines.map((l, i) => ({
+              ...l,
+              tenantId,
+              lineTotal: computeGrnLineTotal(l),
+              baseQty: lineBaseQtys[i],
+            })),
           },
           additionalCosts: { create: payload.additionalCosts.map((c) => ({ ...c, tenantId })) },
         },
@@ -1760,14 +1787,27 @@ router.post(
           ? Number(line.poLine.unitPrice)
           : 0;
 
+        // Stock (and the average-cost it feeds) is always tracked in the
+        // item's base UOM, but acceptedQty/unitCost above are in whatever
+        // unit this line was actually received in - the linked PO line's
+        // own uomId when there is one (see GrnLine.baseQty's doc comment
+        // in schema.prisma). Convert qty and per-unit cost together so the
+        // total value posted to stock stays exactly acceptedQty x unitCost
+        // either way - only the qty/rate split changes, not the total.
+        // Falls back to acceptedQty unchanged (factor 1) when no baseQty
+        // was resolved at save time (e.g. no UOM Conversion configured).
+        const qtyForStock =
+          line.baseQty != null && Number(line.baseQty) > 0 ? Number(line.baseQty) : Number(line.acceptedQty);
+        const unitCostForStock = qtyForStock > 0 ? (Number(line.acceptedQty) * unitCost) / qtyForStock : unitCost;
+
         await postStockMovement(tx, {
           tenantId,
           itemId: line.itemId,
           warehouseId: grn.warehouseId,
           batchNo: line.batchNo,
           expiryDate: line.expiryDate,
-          qtyIn: Number(line.acceptedQty),
-          unitCost,
+          qtyIn: qtyForStock,
+          unitCost: unitCostForStock,
           sourceModule: "Procurement",
           sourceDocType: "GRN",
           sourceDocId: grn.id,
@@ -2116,6 +2156,43 @@ router.get(
   })
 );
 
+/**
+ * Expected AP amount for a set of GRNs, per BRD 5.4's three-way match: each
+ * GRN's own goods value (PO price x accepted qty, or unitCost when there's
+ * no PO line) plus that GRN's own additional costs (freight/insurance/
+ * handling accrued at receiving time), summed across every GRN, plus any
+ * additional costs entered on the invoice itself (e.g. a freight-
+ * forwarder's own separate bill never tied to a GRN). Shared by the create
+ * route (blocks saving a mismatched invoice in the first place) and the
+ * post route (re-checks at posting time in case a GRN's value changed
+ * since this invoice was drafted) so the two can't drift apart.
+ */
+function computeExpectedInvoiceAmount(
+  // Amount/qty/price fields are Prisma Decimal at runtime (or a plain
+  // number for invoiceAdditionalCosts, which come straight off the parsed
+  // zod payload before the invoice is created) - typed loosely here since
+  // every field is immediately run through Number() below regardless.
+  grns: {
+    additionalCosts: { amount: any }[];
+    lines: { acceptedQty: any; unitCost: any; poLine: { unitPrice: any } | null }[];
+  }[],
+  invoiceAdditionalCosts: { amount: any }[]
+) {
+  const grnGoodsValue = grns.reduce((sum, grn) => {
+    const linesTotal = grn.lines.reduce((s, l) => {
+      const price = l.poLine ? Number(l.poLine.unitPrice) : Number(l.unitCost ?? 0);
+      return s + Number(l.acceptedQty) * price;
+    }, 0);
+    return sum + linesTotal;
+  }, 0);
+  const grnAdditionalCostsValue = grns.reduce(
+    (sum, grn) => sum + grn.additionalCosts.reduce((s, c) => s + Number(c.amount), 0),
+    0
+  );
+  const invoiceAdditionalCostsValue = invoiceAdditionalCosts.reduce((s, c) => s + Number(c.amount), 0);
+  return grnGoodsValue + grnAdditionalCostsValue + invoiceAdditionalCostsValue;
+}
+
 // --- Purchase Invoices --------------------------------------------------------
 router.post(
   "/purchase-invoices",
@@ -2146,6 +2223,39 @@ router.post(
       where: { tenantId, vendorId: payload.vendorId, invoiceNo: payload.invoiceNo },
     });
     if (duplicate) throw ApiError.conflict("Duplicate vendor invoice number");
+
+    // Three-way match, enforced at save time (not just at Post) per BRD
+    // 5.4 - a Draft invoice whose gross amount doesn't reconcile with what
+    // its linked GRNs (+ additional costs) actually say it should be is
+    // rejected outright, rather than silently saved and only caught later
+    // when someone tries to post it.
+    const grnIds = Array.from(new Set(payload.lines.map((l) => l.grnId)));
+    const linkedGrns = await prisma.grn.findMany({
+      where: { id: { in: grnIds }, tenantId },
+      include: { lines: { include: { poLine: true } }, additionalCosts: true, branch: { select: { companyId: true } } },
+    });
+    if (linkedGrns.length !== grnIds.length) {
+      throw ApiError.badRequest("One or more selected GRNs could not be found");
+    }
+    const expectedAmount = computeExpectedInvoiceAmount(linkedGrns, payload.additionalCosts);
+    const companyId = linkedGrns[0]?.branch.companyId;
+    if (companyId) {
+      const tolerancePolicy = await resolvePolicy(prisma, {
+        tenantId,
+        companyId,
+        policyType: "PoGrnInvoiceTolerancePct",
+        defaultAllow: true,
+        defaultValue: 2,
+      });
+      const tolerancePct = (tolerancePolicy.value ?? 2) / 100;
+      const variance = expectedAmount === 0 ? 0 : Math.abs(payload.gross - expectedAmount) / expectedAmount;
+      if (variance > tolerancePct) {
+        throw ApiError.badRequest(
+          `Invoice amount ${payload.gross} doesn't match the linked GRN(s) value of ${expectedAmount.toFixed(2)} within the allowed tolerance (variance ${(variance * 100).toFixed(1)}%, allowed ${(tolerancePct * 100).toFixed(1)}%). Check the Supplier Invoice Amount or the additional costs before saving.`,
+          { expectedAmount, invoiceGross: payload.gross, tolerancePct }
+        );
+      }
+    }
 
     const record = await prisma.purchaseInvoice.create({
       data: {
@@ -2261,24 +2371,10 @@ router.post(
     const companyId = invoice.grns[0]?.grn.branch.companyId;
     if (!companyId) throw ApiError.badRequest("This invoice has no linked GRN to resolve its company from");
 
-    const grnGoodsValue = invoice.grns.reduce((sum, bridge) => {
-      const linesTotal = bridge.grn.lines.reduce((s, l) => {
-        const price = l.poLine ? Number(l.poLine.unitPrice) : Number(l.unitCost ?? 0);
-        return s + Number(l.acceptedQty) * price;
-      }, 0);
-      return sum + linesTotal;
-    }, 0);
-    // Each linked GRN's own additional costs (freight/insurance/handling
-    // added at receiving time) count toward the expected match too - the
-    // invoice should cover the GRN's full landed cost, not just its goods.
-    const grnAdditionalCostsValue = invoice.grns.reduce(
-      (sum, bridge) => sum + bridge.grn.additionalCosts.reduce((s, c) => s + Number(c.amount), 0),
-      0
+    const expectedAmount = computeExpectedInvoiceAmount(
+      invoice.grns.map((bridge) => bridge.grn),
+      invoice.additionalCosts
     );
-    // Plus any additional costs entered on the invoice itself (e.g. a
-    // freight-forwarder's own separate bill, never tied to a GRN).
-    const invoiceAdditionalCostsValue = invoice.additionalCosts.reduce((s, c) => s + Number(c.amount), 0);
-    const expectedAmount = grnGoodsValue + grnAdditionalCostsValue + invoiceAdditionalCostsValue;
 
     // Was a hardcoded 2% constant - now reads the company's own tolerance
     // from the Company Policies screen (falls back to the same 2% if the

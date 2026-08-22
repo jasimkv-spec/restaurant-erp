@@ -2012,6 +2012,20 @@ model GrnLine {
   // data to prorate from). Computed and stored at save time - never
   // hand-entered.
   lineTotal    Decimal   @default(0) @db.Decimal(18, 3) @map("line_total")
+  // acceptedQty converted into the item's own base/stock UOM - the actual
+  // physical quantity that should enter the stock ledger. Needed because a
+  // GRN tied to a PO line inherits that PO line's own purchasing UOM (e.g.
+  // a vendor selling in KG while the item is stocked/recipe-costed in GR),
+  // so acceptedQty alone (still "10", meaning 10 KG) isn't safe to post to
+  // stock directly - it would silently record 10 grams instead of 10,000.
+  // Computed at save time via resolveUomQty (same MaterialRequestLine.baseQty
+  // convention) and null when no conversion path is configured, in which
+  // case posting falls back to acceptedQty unchanged (today's behaviour,
+  // not made worse - just not corrected either until someone adds the
+  // missing UOM Conversion record). A line with no PO reference is assumed
+  // already entered in the item's base UOM (no unit picker on a direct GRN
+  // line today), so baseQty there just equals acceptedQty.
+  baseQty      Decimal?  @db.Decimal(18, 3) @map("base_qty")
 
   tenant       Tenant    @relation(fields: [tenantId], references: [id])
   grn          Grn       @relation(fields: [grnId], references: [id])
