@@ -1166,7 +1166,23 @@ router.get(
       },
     });
     if (!record) throw ApiError.notFound();
-    res.json(record);
+
+    // Already-received-so-far per line (across every GRN raised against
+    // this PO, Draft or Posted - matches the same no-status-filter
+    // "fullyReceived" check the /grns/:id/post route itself uses) - lets
+    // the GRN screen's "Recall from PO" panel work out each line's
+    // pending qty without a second round trip.
+    const grnLines = await prisma.grnLine.groupBy({
+      by: ["poLineId"],
+      where: { grn: { poId: record.id }, poLineId: { not: null } },
+      _sum: { acceptedQty: true },
+    });
+    const receivedByLine = new Map(grnLines.map((g) => [g.poLineId as string, Number(g._sum.acceptedQty ?? 0)]));
+
+    res.json({
+      ...record,
+      lines: record.lines.map((l) => ({ ...l, receivedQty: receivedByLine.get(l.id) ?? 0 })),
+    });
   })
 );
 
@@ -1429,6 +1445,9 @@ router.post(
           vendorId: payload.vendorId,
           branchId: payload.branchId,
           warehouseId: payload.warehouseId,
+          // Taken from the authenticated caller, not the request body - same
+          // convention as MaterialRequest.requesterId / PurchaseOrder.createdById.
+          createdById: req.user?.userId,
           lines: { create: payload.lines.map((l) => ({ ...l, tenantId })) },
         },
         include: { lines: true },
@@ -1447,7 +1466,17 @@ router.get(
     const where: Record<string, unknown> = { tenantId };
     if (req.query.status) where.status = req.query.status;
     if (req.query.poId) where.poId = req.query.poId;
-    const items = await prisma.grn.findMany({ where, include: { lines: true }, orderBy: { createdAt: "desc" } });
+    const items = await prisma.grn.findMany({
+      where,
+      include: {
+        lines: true,
+        vendor: true,
+        branch: true,
+        warehouse: true,
+        createdBy: { select: { id: true, displayName: true, email: true } },
+      },
+      orderBy: { createdAt: "desc" },
+    });
     res.json({ data: items });
   })
 );
@@ -1459,7 +1488,15 @@ router.get(
     const tenantId = req.tenant!.id;
     const record = await prisma.grn.findFirst({
       where: { id: req.params.id, tenantId },
-      include: { lines: { include: { item: true, poLine: true } } },
+      include: {
+        lines: { include: { item: true, poLine: true } },
+        vendor: true,
+        // Nested company for the print letterhead - same as MR/PO's own GET :id.
+        branch: { include: { company: true } },
+        warehouse: true,
+        po: true,
+        createdBy: { select: { id: true, displayName: true, email: true } },
+      },
     });
     if (!record) throw ApiError.notFound();
     res.json(record);
@@ -1474,15 +1511,26 @@ router.get(
  */
 router.post(
   "/grns/:id/post",
-  requirePermission("Procurement.Grn.Post"),
   asyncHandler(async (req, res) => {
     const tenantId = req.tenant!.id;
-    const schema = z.object({ companyId: z.string().uuid() });
-    const { companyId } = schema.parse(req.body);
 
-    const grn = await prisma.grn.findFirst({ where: { id: req.params.id, tenantId } });
+    const grn = await prisma.grn.findFirst({
+      where: { id: req.params.id, tenantId },
+      include: { branch: { select: { companyId: true } } },
+    });
     if (!grn) throw ApiError.notFound();
     if (grn.status !== "Draft") throw ApiError.badRequest(`GRN already ${grn.status}`);
+    // Must hold the Post permission AND be the GRN creator (or somewhere
+    // above them in the manager chain) - see assertCanApprove's doc comment.
+    await assertCanApprove(prisma, req, {
+      tenantId,
+      requesterUserId: grn.createdById,
+      permission: "Procurement.Grn.Post",
+    });
+    // Resolved from the GRN's own branch rather than requiring the client to
+    // send it - the generic lifecycle button (DocumentScreen) posts an empty
+    // body, same as every other module's submit/approve action.
+    const companyId = grn.branch.companyId;
 
     const linesWithDetail = await prisma.grnLine.findMany({
       where: { grnId: grn.id },

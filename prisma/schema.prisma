@@ -596,6 +596,7 @@ model User {
   mrRequested       MaterialRequest[] @relation("MrRequester")
   mrApproved        MaterialRequest[] @relation("MrApprovedBy")
   poCreated         PurchaseOrder[] @relation("PoCreatedBy")
+  grnCreated        Grn[] @relation("GrnCreatedBy")
 
   @@unique([tenantId, email])
   @@index([tenantId])
@@ -1951,6 +1952,10 @@ model Grn {
   grnDate    DateTime @default(now()) @map("grn_date")
   status     String   @default("Draft") // Draft|Posted|Cancelled
   qcStatus   String   @default("Pending") @map("qc_status") // Pending|Accepted|Rejected|OnHold
+  // Taken from the authenticated caller at creation time - same convention
+  // as MaterialRequest.requesterId / PurchaseOrder.createdById. Used by the
+  // approval-authority check (assertCanApprove) on POST /grns/:id/post.
+  createdById String? @map("created_by_id")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
 
@@ -1959,6 +1964,7 @@ model Grn {
   vendor     Vendor    @relation(fields: [vendorId], references: [id])
   branch     Branch    @relation(fields: [branchId], references: [id])
   warehouse  Warehouse @relation(fields: [warehouseId], references: [id])
+  createdBy  User?     @relation("GrnCreatedBy", fields: [createdById], references: [id])
 
   lines             GrnLine[]
   purchaseInvoices  PurchaseInvoiceGrn[]
