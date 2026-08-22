@@ -73,17 +73,24 @@ export async function postStockMovement(tx: Tx, input: StockMovementInput) {
     date: movementDate,
   });
 
-  const balanceKey = {
-    tenantId_itemId_warehouseId_batchNo_expiryDate: {
-      tenantId,
-      itemId,
-      warehouseId,
-      batchNo: batchNo ?? "",
-      expiryDate: expiryDate as any,
-    },
+  // Not using the tenantId_itemId_warehouseId_batchNo_expiryDate compound-key
+  // shorthand here - Prisma's generated WhereUniqueInput for a compound
+  // index rejects `null` for any of its fields even though expiryDate itself
+  // is a nullable column ("Argument `expiryDate` must not be null"), so an
+  // unbatched/non-expiring item (the common case - most items have no batch
+  // or expiry tracking) would throw on every single stock movement. A plain
+  // findFirst has no such restriction and null filters normally, so we look
+  // the row up that way and then create/update by its own id instead of
+  // upserting on the compound key.
+  const balanceFilter = {
+    tenantId,
+    itemId,
+    warehouseId,
+    batchNo: batchNo ?? "",
+    expiryDate: expiryDate ?? null,
   };
 
-  const existingBalance = await tx.stockBalance.findUnique({ where: balanceKey as any });
+  const existingBalance = await tx.stockBalance.findFirst({ where: balanceFilter });
   const priorQty = existingBalance ? Number(existingBalance.quantity) : 0;
   const priorValue = existingBalance ? Number(existingBalance.value) : 0;
   const priorAvgCost = priorQty !== 0 ? priorValue / priorQty : 0;
@@ -154,19 +161,24 @@ export async function postStockMovement(tx: Tx, input: StockMovementInput) {
   const newQty = priorQty + qtyIn - qtyOut;
   const newValue = priorValue + qtyIn * appliedUnitCost - qtyOut * priorAvgCost;
 
-  await tx.stockBalance.upsert({
-    where: balanceKey as any,
-    update: { quantity: newQty, value: newValue },
-    create: {
-      tenantId,
-      itemId,
-      warehouseId,
-      batchNo: batchNo ?? "",
-      expiryDate,
-      quantity: newQty,
-      value: newValue,
-    },
-  });
+  if (existingBalance) {
+    await tx.stockBalance.update({
+      where: { id: existingBalance.id },
+      data: { quantity: newQty, value: newValue },
+    });
+  } else {
+    await tx.stockBalance.create({
+      data: {
+        tenantId,
+        itemId,
+        warehouseId,
+        batchNo: batchNo ?? "",
+        expiryDate,
+        quantity: newQty,
+        value: newValue,
+      },
+    });
+  }
 
   await refreshItemCostFields(tx, tenantId, itemId, qtyIn > 0 ? appliedUnitCost : undefined, movementDate);
 
