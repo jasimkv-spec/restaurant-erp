@@ -5,6 +5,7 @@ import { prisma } from "../../lib/prisma";
 import { crudRouter } from "../../utils/crudFactory";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { requirePermission, hasPermission } from "../../middleware/rbac";
+import { requireModule } from "../../middleware/moduleGate";
 import { ApiError } from "../../utils/errors";
 import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
@@ -17,6 +18,9 @@ import { resolveUomQty } from "../../utils/uomConversion";
 import { computePoLineAmounts } from "../../services/poCalc";
 
 const router = Router();
+// Whole-module entitlement gate - see requireModule for how this differs
+// from the per-route requirePermission checks below.
+router.use(requireModule("Procurement"));
 
 // --- Vendors --------------------------------------------------------------
 router.use(

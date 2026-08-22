@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { requirePermission } from "../../middleware/rbac";
+import { requireModule } from "../../middleware/moduleGate";
 import { ApiError } from "../../utils/errors";
 import { nextDocumentNumber } from "../../utils/documentNumber";
 import { postStockMovement } from "../../services/stockService";
@@ -11,6 +12,7 @@ import { resolveItemGl } from "../../services/coaLookup";
 import { explodeRecipeVersion } from "../../services/recipeExplosion";
 
 const router = Router();
+router.use(requireModule("Recipe"));
 
 const ingredientSchema = z.object({
   ingredientItemId: z.string().uuid(),
